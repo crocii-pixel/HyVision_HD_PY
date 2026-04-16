@@ -151,3 +151,6 @@ cython_debug/
 # Project Specific
 *.mdl
 test_unit/_diag_serial.py
+
+# Claude Code session data
+.claude/

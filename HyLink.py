@@ -7,8 +7,9 @@ import glob
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
 from HyProtocol import HyProtocol
+from VirtualMachine import VirtualMachine  # 가상 비전 머신 임포트
 
-class OpenMVWorker(QThread):
+class HyLink(QThread):
     log_signal = pyqtSignal(str, str)
     frame_signal = pyqtSignal(QImage, int)
     burst_results_signal = pyqtSignal(list, int)
@@ -21,25 +22,48 @@ class OpenMVWorker(QThread):
         self.running = False
         
         self.is_virtual = False
-        self.virtual_folder = ""
+        self.virtual_source = ""
         self.update_interval_ms = 100
         
         self.cmd_queue = queue.Queue()
         self.current_tx_id = 0
         self.tx_callbacks = {}
 
-    def start_virtual_camera(self, folder_path, interval_ms=100):
+    def start_virtual_camera(self, image_source, interval_ms=100):
+        """
+        기존의 단순 파일 뷰어를 넘어 VirtualVisionEngine(VVM)을 기동합니다.
+        image_source: 폴더 경로(str) 또는 웹캠 인덱스(int)
+        """
         self.port_name = "VIRTUAL"
         self.is_virtual = True
-        self.virtual_folder = folder_path
+        self.virtual_source = image_source
         self.update_interval_ms = interval_ms
         self.start()
 
-    def send_command(self, cmd_struct, callback=None):
+    def send_command(self, cmd_data, callback=None):
+        """
+        💡 [핵심] UI에서 보낸 과거 1바이트 명령을 32B 통합 규격(Struct)으로 자동 변환 (어댑터 패턴)
+        """
+        if isinstance(cmd_data, bytes) and len(cmd_data) == 1:
+            cmd_byte = cmd_data
+            cmd_id = 0x00 # STOP
+            
+            if cmd_byte == b'l': cmd_id = 0x01   # LIVE
+            elif cmd_byte == b'c': cmd_id = 0x02 # TEACH_SNAP
+            elif cmd_byte == b't': cmd_id = 0x03 # TEST
+            elif cmd_byte == b'x': cmd_id = 0x00 # STOP
+            
+            # 통합 제어 프로토콜 규격: <H B B 4i I 8x (32 Bytes)
+            cmd_struct = struct.pack('<HBBiiiiI8x', 0xBB66, cmd_id, 0, 0, 0, 0, 0, 0)
+        else:
+            # 이미 32바이트 구조체로 포맷팅되어 넘어온 경우
+            cmd_struct = cmd_data
+
         self.current_tx_id += 1
         if callback:
             self.tx_callbacks[self.current_tx_id] = callback
-        self.cmd_queue.put((self.current_tx_id, cmd_struct))
+            
+        self.cmd_queue.put(cmd_struct)
         return self.current_tx_id
 
     def stop(self):
@@ -53,45 +77,65 @@ class OpenMVWorker(QThread):
     def run(self):
         self.running = True
         if self.is_virtual:
-            self._run_virtual_loop()
+            self._run_virtual_engine_loop()
         else:
             self._run_serial_loop()
 
-    def _run_virtual_loop(self):
-        self.log_signal.emit(f"가상 카메라 모드 시작: {self.virtual_folder}", "system")
+    # ==============================================================================
+    # [가상 환경 모드] VVM을 띄우고 메모리 큐(Queue)로 통신하는 루프
+    # ==============================================================================
+    def _run_virtual_engine_loop(self):
+        self.log_signal.emit(f"가상 비전 머신(VVM) 모드 시작: {self.virtual_source}", "system")
         self.connected_signal.emit(1)
-        image_files = []
-        for ext in ('*.jpg', '*.jpeg', '*.png', '*.bmp'):
-            image_files.extend(glob.glob(os.path.join(self.virtual_folder, ext)))
-        image_files.sort()
         
-        if not image_files:
-            self.log_signal.emit("폴더에 이미지가 없습니다.", "error")
-            self.connected_signal.emit(0)
-            return
-
-        img_id = 0; file_idx = 0
+        # VVM 인스턴스 생성 및 스레드 분리 실행
+        vvm_res_queue = queue.Queue()
+        vvm = VirtualMachine(self.cmd_queue, vvm_res_queue, self.virtual_source, self.update_interval_ms)
+        vvm.start()
+        
         while self.running:
-            start_t = time.time()
-            img_path = image_files[file_idx]
-            qimg = QImage(img_path)
-            
-            if not qimg.isNull():
-                img_id += 1
-                self.frame_signal.emit(qimg, img_id)
-            file_idx = (file_idx + 1) % len(image_files)
-            
-            elapsed_ms = (time.time() - start_t) * 1000
-            time.sleep(max(0, (self.update_interval_ms - elapsed_ms) / 1000.0))
+            try:
+                # VVM에서 64B 결과 버스트와 QImage 수신 (실제 시리얼처럼 블로킹 대기)
+                burst_bytes, qimg, cycle_id = vvm_res_queue.get(timeout=0.05)
+                
+                # Burst 헤더(0xAA55) 파싱 및 64바이트 쪼개기
+                if len(burst_bytes) >= 4:
+                    sync, count = struct.unpack('<HH', burst_bytes[:4])
+                    if sync == 0xAA55:
+                        parsed_results = []
+                        offset = 4
+                        for _ in range(count):
+                            if offset + 64 <= len(burst_bytes):
+                                packet = burst_bytes[offset:offset+64]
+                                parsed = HyProtocol.unpack_result(packet)
+                                if parsed:
+                                    parsed_results.append(parsed)
+                                offset += 64
+                                
+                        if parsed_results:
+                            self.burst_results_signal.emit(parsed_results, cycle_id)
+                            
+                        img_id = parsed_results[0]['imgID'] if parsed_results else 0
+                        self.frame_signal.emit(qimg, img_id)
+                    
+            except queue.Empty:
+                pass
+            except Exception as e:
+                self.log_signal.emit(f"VVM 큐 읽기 에러: {e}", "error")
+                
+        # 워커 종료 시 가상 엔진도 함께 종료
+        vvm.stop()
         self.connected_signal.emit(0)
 
+    # ==============================================================================
+    # [실 환경 모드] 시리얼 통신으로 장치(OpenMV)와 통신하는 루프
+    # ==============================================================================
     def _run_serial_loop(self):
         try:
             self.serial_port = serial.Serial(self.port_name, baudrate=115200, timeout=1.0)
             self.serial_port.dtr = True
             self.serial_port.rts = True
             time.sleep(0.5)
-            # 버퍼 비우기 (연결 직후 발생한 가비지 데이터 제거)
             self.serial_port.reset_input_buffer()
             self.log_signal.emit(f"포트 연결 성공: {self.port_name}", "success")
             self.connected_signal.emit(1)
@@ -99,9 +143,9 @@ class OpenMVWorker(QThread):
             while self.running:
                 if not self.serial_port.is_open: break
                 
-                # 1. 큐에 쌓인 명령 전송 처리
+                # 1. 큐에 쌓인 32B 명령 전송
                 try:
-                    tx_id, cmd_data = self.cmd_queue.get_nowait()
+                    cmd_data = self.cmd_queue.get_nowait()
                     self.serial_port.write(cmd_data)
                     self.serial_port.flush()
                 except queue.Empty:
