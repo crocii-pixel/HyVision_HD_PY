@@ -14,8 +14,9 @@ from PyQt5.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QSizePolicy,
     QGroupBox, QToolButton, QMenu, QAction, QDialog, QDialogButtonBox
 )
-from PyQt5.QtCore  import Qt, QTimer, QSize, QMimeData, QPoint
-from PyQt5.QtGui   import QColor, QFont, QIcon, QDrag, QCursor, QImage
+from PyQt5.QtCore  import Qt, QTimer, QSize, QMimeData, QPoint, QSettings
+from PyQt5.QtGui   import QColor, QFont, QIcon, QDrag, QCursor, QImage, QKeySequence
+from PyQt5.QtWidgets import QShortcut
 
 from HyProtocol    import HyProtocol
 from HyVisionTools import (HyTool, HyLogicTool, HyLine, HyPatMat, HyLocator,
@@ -341,6 +342,9 @@ class InspectorApp(QMainWindow):
         self.link: HyLink | None = None
         self.vm:   VirtualMachine | None = None
 
+        # ─ 레시피 저장 상태 (P4-27) ──────────────────────────────────────────
+        self._recipe_path: str | None = None  # 현재 열린 .hyv 파일 경로
+
         # ─ 모드 상태 ──────────────────────────────────────────────────────────
         self._mode     = "STANDBY"   # STANDBY / LIVE / TEACH / TEST / RUN
         self._connected = False
@@ -352,6 +356,10 @@ class InspectorApp(QMainWindow):
         # ─ UI 구성 ────────────────────────────────────────────────────────────
         self._build_ui()
         self.resize(1400, 860)
+
+        # Ctrl+S 단축키 — 레시피 저장
+        sc = QShortcut(QKeySequence.Save, self)
+        sc.activated.connect(self._save_recipe)
 
     # ─────────────────────────────────────────────────────────────────────────
     # UI 구성
@@ -435,6 +443,29 @@ class InspectorApp(QMainWindow):
         hb.addWidget(self._btn_refresh)
         hb.addWidget(self._btn_connect)
         hb.addWidget(self._lbl_status)
+
+        # P4-27: 레시피 저장/로드 버튼
+        hb.addSpacing(8)
+        self._btn_recipe_open = _icon_btn("📂 열기", "레시피 파일 열기  (Ctrl+O)")
+        self._btn_recipe_open.setFixedWidth(72)
+        self._btn_recipe_open.clicked.connect(self._load_recipe)
+        hb.addWidget(self._btn_recipe_open)
+
+        self._btn_recipe_save = _icon_btn("💾 저장", "레시피 저장  (Ctrl+S)")
+        self._btn_recipe_save.setFixedWidth(72)
+        self._btn_recipe_save.clicked.connect(self._save_recipe)
+        hb.addWidget(self._btn_recipe_save)
+
+        self._btn_recipe_saveas = _icon_btn("💾 다른이름", "레시피 다른 이름으로 저장")
+        self._btn_recipe_saveas.setFixedWidth(96)
+        self._btn_recipe_saveas.clicked.connect(self._save_recipe_as)
+        hb.addWidget(self._btn_recipe_saveas)
+
+        # 저장 상태 레이블 (💾/✅/⚠)
+        self._lbl_recipe_status = QLabel("⚠ 미저장")
+        self._lbl_recipe_status.setStyleSheet(
+            "color:#94a3b8;font-size:10px;min-width:90px;")
+        hb.addWidget(self._lbl_recipe_status)
 
         self._refresh_ports()
         return hb
@@ -861,6 +892,7 @@ class InspectorApp(QMainWindow):
         self._canvas_teach.set_active_tool(tid)
         self._overlay.show_tool(tool)
         self._sync_recipe_to_vm()
+        self._update_recipe_status()
         self.log(f"툴 추가: {tool.name} (id={tid})", "success")
 
     def _delete_selected_teach_tool(self):
@@ -877,6 +909,7 @@ class InspectorApp(QMainWindow):
         self._canvas_teach.set_active_tool(None)
         self._refresh_teach_list()
         self._sync_recipe_to_vm()
+        self._update_recipe_status()
         self.log(f"툴 삭제 (id={tool_id})", "info")
 
     def _teach_snap(self):
@@ -928,7 +961,7 @@ class InspectorApp(QMainWindow):
     def _on_roi_changed(self, tool_id, x, y, w, h):
         """ROI 드래그 완료 → VVM 에 SET_TOOL 전송 + Preview 실행."""
         if self.link:
-            tool = self.recipe_tree.get_tool(tool_id) if self.recipe_tree else None
+            tool = self.recipe.get_tool(tool_id)
             tt   = tool.tool_type if tool else 0
             rot  = getattr(tool, 'rot_angle', 0.0) if tool else 0.0
             pid  = tool.parent_id if tool else 0
@@ -945,6 +978,7 @@ class InspectorApp(QMainWindow):
                 ],
                 fparam=rot,
             )
+        self._update_recipe_status()
         self._run_preview()
 
     def _on_overlay_changed(self):
@@ -1012,6 +1046,101 @@ class InspectorApp(QMainWindow):
         # DFS 직렬화 후 전송
         for cmd in self.recipe.serialize_to_commands():
             self.link._cmd_q.put(cmd)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # P4-27 레시피 저장 / 로드 UI
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _save_recipe(self):
+        """Ctrl+S / 💾 저장 버튼. 파일 경로가 없으면 다른 이름으로 저장."""
+        if self._recipe_path is None:
+            self._save_recipe_as()
+            return
+        ok = self.recipe.save_to_file(self._recipe_path)
+        if ok:
+            self.log(f"레시피 저장 완료: {os.path.basename(self._recipe_path)}", "success")
+        else:
+            QMessageBox.critical(self, "저장 실패",
+                                 f"파일을 저장할 수 없습니다:\n{self._recipe_path}")
+        self._update_recipe_status()
+
+    def _save_recipe_as(self):
+        """다른 이름으로 저장 다이얼로그."""
+        settings   = QSettings("HyVision", "ProInspector")
+        last_dir   = settings.value("last_recipe_dir",
+                                    os.path.expanduser("~"), type=str)
+        path, _    = QFileDialog.getSaveFileName(
+            self, "레시피 저장", last_dir,
+            "HyVision 레시피 (*.hyv);;모든 파일 (*)")
+        if not path:
+            return
+        if not path.endswith('.hyv'):
+            path += '.hyv'
+        ok = self.recipe.save_to_file(path)
+        if ok:
+            self._recipe_path = path
+            settings.setValue("last_recipe_dir", os.path.dirname(path))
+            self.log(f"레시피 저장: {os.path.basename(path)}", "success")
+        else:
+            QMessageBox.critical(self, "저장 실패",
+                                 f"파일을 저장할 수 없습니다:\n{path}")
+        self._update_recipe_status()
+
+    def _load_recipe(self):
+        """📂 열기 버튼 — 파일 다이얼로그 → 레시피 로드."""
+        # 변경 사항 확인
+        if self.recipe.dirty:
+            reply = QMessageBox.question(
+                self, "변경 내용 저장",
+                "저장하지 않은 변경 내용이 있습니다. 계속 진행하면 변경 내용이 사라집니다.",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if reply == QMessageBox.Save:
+                self._save_recipe()
+                return
+            elif reply == QMessageBox.Cancel:
+                return
+
+        settings = QSettings("HyVision", "ProInspector")
+        last_dir = settings.value("last_recipe_dir",
+                                  os.path.expanduser("~"), type=str)
+        path, _  = QFileDialog.getOpenFileName(
+            self, "레시피 열기", last_dir,
+            "HyVision 레시피 (*.hyv);;모든 파일 (*)")
+        if not path:
+            return
+
+        ok = self.recipe.load_from_file(path)
+        if ok:
+            self._recipe_path = path
+            settings.setValue("last_recipe_dir", os.path.dirname(path))
+            self.log(f"레시피 로드: {os.path.basename(path)}", "success")
+            # UI 갱신
+            self._refresh_teach_list()
+            self._refresh_test_phys_list()
+            self._logic_tree.rebuild()
+            self._sync_recipe_to_vm()
+        else:
+            QMessageBox.critical(self, "로드 실패",
+                                 f"레시피 파일을 열 수 없습니다 (CRC 오류 또는 손상된 파일):\n{path}")
+        self._update_recipe_status()
+
+    def _update_recipe_status(self):
+        """레시피 상태 레이블 갱신 (💾/✅/⚠)."""
+        if not self.recipe.tool_index:
+            text  = "⚠ 비어있음"
+            color = "#64748b"
+        elif self.recipe.dirty:
+            fname = os.path.basename(self._recipe_path) if self._recipe_path else "미저장"
+            text  = f"💾 {fname}"
+            color = "#facc15"
+        else:
+            fname = os.path.basename(self._recipe_path) if self._recipe_path else ""
+            text  = f"✅ {fname}" if fname else "✅ 저장됨"
+            color = "#34d399"
+        self._lbl_recipe_status.setText(text)
+        self._lbl_recipe_status.setStyleSheet(
+            f"color:{color};font-size:10px;min-width:90px;")
 
     # ─────────────────────────────────────────────────────────────────────────
     # 로그
