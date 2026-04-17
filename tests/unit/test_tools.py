@@ -1,6 +1,6 @@
 """
 U-05  HyTool execute() 캐싱 — 동일 img_id 재호출 시 _run 1회만
-U-06  HyLine rot_angle 반영 — 회전된 ROI에서 선 추출 (각도 오차 ≤ 0.5deg)
+U-06  HyLine 선 각도 검출 정밀도 — 합성 이미지 기준 각도 오차 ≤ 0.5°
 U-07  HyAnd NG > PENDING > OK — [OK, PENDING, NG] → JUDGE_NG
 U-08  HyAnd PENDING 전파 — [OK, PENDING, OK] → JUDGE_PENDING
 U-09  HyOr OK 단축 평가 → JUDGE_OK
@@ -14,6 +14,7 @@ U-15  RecipeTree State Injection — tool_id 기반
 import sys
 import os
 import time
+import math
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
@@ -100,10 +101,42 @@ class TestExecuteCache:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# U-06  HyLine rot_angle 속성 존재 확인 (cv2 없는 환경 대응)
+# U-06  HyLine 속성 + 선 각도 검출 정밀도 (각도 오차 ≤ 0.5°)
 # ─────────────────────────────────────────────────────────────────────
 
+def _line_image(angle_deg: float, w: int = 320, h: int = 240,
+                stripe_w: int = 10) -> np.ndarray:
+    """알려진 각도의 밝은 선(stripe)이 포함된 그레이스케일 합성 이미지 반환.
+
+    angle_deg: 수평에서 측정한 기울기 각도 (도). 양수 = 우측 아래 방향.
+    stripe_w:  선의 두께 (px).
+    """
+    img  = np.zeros((h, w), dtype=np.uint8)
+    m    = math.tan(math.radians(angle_deg))   # 픽셀 기울기 (dy/dx)
+    cy   = h / 2.0
+    half = stripe_w / 2.0
+    for x in range(w):
+        y_center = m * (x - w / 2.0) + cy
+        y0 = max(0, int(math.floor(y_center - half)))
+        y1 = min(h, int(math.ceil(y_center + half)) + 1)
+        img[y0:y1, x] = 255
+    return img
+
+
+def _detect_angle(angle_deg: float, w: int = 320, h: int = 240) -> float:
+    """합성 이미지에서 HyLine 이 검출한 각도(도)를 반환."""
+    img  = _line_image(angle_deg, w=w, h=h)
+    line = HyLine(tool_id=1)
+    line.search_roi = (0, 0, w, h)
+    line.execute(img, img_id=1, cycle_id=1)
+    assert line.rst_state == HyProtocol.JUDGE_OK, \
+        f"JUDGE_OK expected for angle={angle_deg}, got rst_state={line.rst_state}"
+    return line.angle
+
+
 class TestHyLineRotAngle:
+    """rot_angle 속성 기본 검사 (직렬화/표시 용도 확인)."""
+
     def test_rot_angle_default_zero(self):
         line = HyLine(tool_id=1)
         assert hasattr(line, 'rot_angle')
@@ -113,6 +146,33 @@ class TestHyLineRotAngle:
         line = HyLine(tool_id=1)
         line.rot_angle = 15.0
         assert line.rot_angle == 15.0
+
+
+class TestHyLineAngleDetection:
+    """U-06 수용 기준: 합성 선 이미지에서 각도 오차 ≤ 0.5°."""
+
+    def test_horizontal_line_zero_angle(self):
+        """수평선(0°) 검출 — 오차 ≤ 0.5°."""
+        detected = _detect_angle(0.0)
+        assert abs(detected) <= 0.5, f"horizontal: expected ~0, got {detected:.3f}"
+
+    def test_positive_15_degree_line(self):
+        """15° 기울어진 선 검출 — 오차 ≤ 0.5°."""
+        detected = _detect_angle(15.0)
+        assert abs(detected - 15.0) <= 0.5, \
+            f"+15 deg: expected ~15, got {detected:.3f}"
+
+    def test_negative_10_degree_line(self):
+        """-10° 기울어진 선 검출 — 오차 ≤ 0.5°."""
+        detected = _detect_angle(-10.0)
+        assert abs(detected - (-10.0)) <= 0.5, \
+            f"-10 deg: expected ~-10, got {detected:.3f}"
+
+    def test_small_5_degree_line(self):
+        """5° 미세 기울기 검출 — 오차 ≤ 0.5°."""
+        detected = _detect_angle(5.0)
+        assert abs(detected - 5.0) <= 0.5, \
+            f"+5 deg: expected ~5, got {detected:.3f}"
 
 
 # ─────────────────────────────────────────────────────────────────────
