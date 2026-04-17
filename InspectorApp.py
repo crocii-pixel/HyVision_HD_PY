@@ -4,6 +4,7 @@ LIVE / TEACH / TEST / RUN 4대 모드 통합 UI.
 """
 import sys
 import os
+import json
 import time
 import ctypes
 
@@ -12,11 +13,15 @@ from PyQt5.QtWidgets import (
     QSplitter, QPushButton, QLabel, QFrame, QComboBox, QTextEdit,
     QFileDialog, QMessageBox, QListWidget, QListWidgetItem,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QSizePolicy,
-    QGroupBox, QToolButton, QMenu, QAction, QDialog, QDialogButtonBox
+    QGroupBox, QToolButton, QMenu, QAction, QDialog, QDialogButtonBox,
+    QInputDialog, QSlider, QSpinBox, QDoubleSpinBox, QScrollArea,
 )
 from PyQt5.QtCore  import Qt, QTimer, QSize, QMimeData, QPoint, QSettings
 from PyQt5.QtGui   import QColor, QFont, QIcon, QDrag, QCursor, QImage, QKeySequence
 from PyQt5.QtWidgets import QShortcut
+
+_TEMPLATE_DIR  = os.path.join(os.path.expanduser("~"), ".hyvision")
+_TEMPLATE_FILE = os.path.join(_TEMPLATE_DIR, "logic_templates.json")
 
 from HyProtocol    import HyProtocol
 from HyVisionTools import (HyTool, HyLogicTool, HyLine, HyPatMat, HyLocator,
@@ -164,6 +169,7 @@ class LogicTreeWidget(QTreeWidget):
     def __init__(self, recipe: RecipeTree, parent=None):
         super().__init__(parent)
         self.recipe = recipe
+        self._clipboard: dict | None = None   # P4-10: 복사/붙여넣기 클립보드
         self.setColumnCount(3)
         self.setHeaderLabels(["툴", "상태", "결과"])
         self.setColumnWidth(0, 200)
@@ -283,7 +289,7 @@ class LogicTreeWidget(QTreeWidget):
         self.rebuild()
         event.acceptProposedAction()
 
-    # ─── 컨텍스트 메뉴 ────────────────────────────────────────────────────────
+    # ─── 컨텍스트 메뉴 (P4-10) ────────────────────────────────────────────────
 
     def _context_menu(self, pos: QPoint):
         item = self.itemAt(pos)
@@ -298,6 +304,16 @@ class LogicTreeWidget(QTreeWidget):
 
             act_del = menu.addAction("🗑 삭제")
             act_del.triggered.connect(lambda: self._delete_tool(tool_id))
+
+            menu.addSeparator()
+            act_copy = menu.addAction("📋 복사  Ctrl+C")
+            act_copy.triggered.connect(lambda: self._do_copy(tool_id))
+            if self._clipboard:
+                act_paste = menu.addAction("📋 붙여넣기 (자식)  Ctrl+V")
+                act_paste.triggered.connect(lambda: self._do_paste(parent_id=tool_id))
+            menu.addSeparator()
+            act_tmpl = menu.addAction("💾 템플릿 저장")
+            act_tmpl.triggered.connect(lambda: self._save_template(tool_id))
 
             if isinstance(tool, HyLogicTool):
                 menu.addSeparator()
@@ -322,6 +338,21 @@ class LogicTreeWidget(QTreeWidget):
                 act = sub.addAction(tname)
                 act.triggered.connect(
                     lambda checked, tt=ttype: self._add_root(tt))
+            if self._clipboard:
+                menu.addSeparator()
+                act_paste_root = menu.addAction("📋 붙여넣기 (루트)  Ctrl+V")
+                act_paste_root.triggered.connect(lambda: self._do_paste(parent_id=0))
+            # 템플릿 로드 서브메뉴
+            tmpls = self._load_templates()
+            if tmpls:
+                menu.addSeparator()
+                tmpl_sub = menu.addMenu("📂 템플릿 로드")
+                for t in tmpls:
+                    a = tmpl_sub.addAction(t['name'])
+                    a.triggered.connect(
+                        lambda checked, d=t['tree']: (
+                            self._paste_subtree(d, parent_id=0),
+                            self.rebuild()))
 
         menu.exec_(self.viewport().mapToGlobal(pos))
 
@@ -344,6 +375,90 @@ class LogicTreeWidget(QTreeWidget):
             QMessageBox.warning(self, "삭제 실패", str(e))
         self.rebuild()
 
+    # ─── P4-10: 복사/붙여넣기/템플릿 ──────────────────────────────────────────
+
+    def _serialize_subtree(self, tool_id: int) -> dict | None:
+        """툴과 하위 트리를 dict 로 직렬화 (로직 툴 전용)."""
+        tool = self.recipe.get_tool(tool_id)
+        if tool is None:
+            return None
+        data: dict = {'tool_type': tool.tool_type, 'name': tool.name, 'children': []}
+        # 타입별 추가 속성
+        if isinstance(tool, HyWhen):
+            data.update({
+                'watch_tool_id': tool.watch_tool_id,
+                'condition':     tool.condition,
+                'timeout_ms':    tool.timeout_ms,
+                'output_mode':   tool.output_mode,
+            })
+        elif isinstance(tool, HyFin):
+            data.update({
+                'broadcast_target': tool.broadcast_target,
+                'io_mapping':       {str(k): v for k, v in tool.io_mapping.items()},
+            })
+        # 자식 재귀
+        if isinstance(tool, HyLogicTool):
+            for child in tool.children:
+                cd = self._serialize_subtree(child.tool_id)
+                if cd:
+                    data['children'].append(cd)
+        return data
+
+    def _paste_subtree(self, data: dict, parent_id: int = 0) -> int | None:
+        """직렬화된 dict 로 툴 재생성 (새 tool_id). 최상위 id 반환."""
+        if not data:
+            return None
+        tool_type = data.get('tool_type')
+        if tool_type is None:
+            return None
+        tid  = self.recipe.alloc_id()
+        tool = create_tool(tool_type, tid)
+        tool.name = data.get('name', tool.name) + "_copy"
+        if isinstance(tool, HyWhen):
+            tool.watch_tool_id = data.get('watch_tool_id', 0)
+            tool.condition     = data.get('condition', 0)
+            tool.timeout_ms    = data.get('timeout_ms', 1000)
+            tool.output_mode   = data.get('output_mode', 0)
+        elif isinstance(tool, HyFin):
+            tool.broadcast_target = data.get('broadcast_target', 'status_box')
+            tool.io_mapping = {int(k): v for k, v in data.get('io_mapping', {}).items()}
+        self.recipe.add_tool(tool, parent_id=parent_id)
+        for child_data in data.get('children', []):
+            self._paste_subtree(child_data, parent_id=tid)
+        return tid
+
+    def _do_copy(self, tool_id: int):
+        self._clipboard = self._serialize_subtree(tool_id)
+
+    def _do_paste(self, parent_id: int = 0):
+        if self._clipboard:
+            self._paste_subtree(self._clipboard, parent_id=parent_id)
+            self.rebuild()
+
+    def _save_template(self, tool_id: int):
+        data = self._serialize_subtree(tool_id)
+        if data is None:
+            return
+        name, ok = QInputDialog.getText(self, "템플릿 저장", "템플릿 이름:")
+        if not ok or not name.strip():
+            return
+        templates = self._load_templates()
+        templates = [t for t in templates if t['name'] != name.strip()]
+        templates.append({'name': name.strip(), 'tree': data})
+        os.makedirs(_TEMPLATE_DIR, exist_ok=True)
+        with open(_TEMPLATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'templates': templates}, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _load_templates() -> list:
+        if not os.path.exists(_TEMPLATE_FILE):
+            return []
+        try:
+            with open(_TEMPLATE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f).get('templates', [])
+        except Exception:
+            return []
+
     # ─── P4-11 키보드 단축키 ────────────────────────────────────────────────
 
     def keyPressEvent(self, event):
@@ -363,6 +478,16 @@ class LogicTreeWidget(QTreeWidget):
         elif event.key() == Qt.Key_F2 and item:
             # F2 — 인라인 이름 편집 (QTreeWidget 편집 모드)
             self.editItem(item, 0)
+
+        elif event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_C:
+            # Ctrl+C — 복사
+            if item:
+                self._do_copy(item.data(0, Qt.UserRole))
+
+        elif event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_V:
+            # Ctrl+V — 붙여넣기 (선택 노드의 자식으로, 없으면 루트)
+            parent_id = item.data(0, Qt.UserRole) if item else 0
+            self._do_paste(parent_id=parent_id or 0)
 
         elif event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_F:
             # Ctrl+F — 첫 번째 HyFin 노드로 포커스 이동
@@ -396,6 +521,9 @@ class InspectorApp(QMainWindow):
 
         # ─ 레시피 저장 상태 (P4-27) ──────────────────────────────────────────
         self._recipe_path: str | None = None  # 현재 열린 .hyv 파일 경로
+
+        # ─ P4-19: 카메라 설정 롤백 ────────────────────────────────────────────
+        self._cam_settings_saved: dict | None = None  # LIVE 진입 전 저장값
 
         # ─ RUN 모드 지표 (P4-24) ─────────────────────────────────────────────
         self._run_total = 0
@@ -577,11 +705,78 @@ class InspectorApp(QMainWindow):
         return w
 
     def _build_page_live(self) -> QWidget:
-        w = QWidget()
-        vb = QVBoxLayout(w)
-        vb.setContentsMargins(0, 0, 0, 0)
+        """P4-19: LIVE 모드 — 스트리밍 캔버스 + 카메라 설정 패널."""
+        w   = QWidget()
+        hb  = QHBoxLayout(w)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.setSpacing(0)
+
         self._canvas_live = VisionCanvas(self.recipe)
-        vb.addWidget(self._canvas_live)
+        hb.addWidget(self._canvas_live, 1)
+
+        # ── 우측 카메라 설정 패널 ─────────────────────────────────────────────
+        cam_panel = QWidget()
+        cam_panel.setFixedWidth(220)
+        cam_panel.setStyleSheet("background:#0b1120;border-left:1px solid #1e293b;")
+        cp_vb = QVBoxLayout(cam_panel)
+        cp_vb.setContentsMargins(12, 12, 12, 12)
+        cp_vb.setSpacing(10)
+
+        title = QLabel("📷 카메라 설정")
+        title.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        title.setStyleSheet("color:#e2e8f0;border:none;")
+        cp_vb.addWidget(title)
+
+        _sep_lbl = QFrame()
+        _sep_lbl.setFrameShape(QFrame.HLine)
+        _sep_lbl.setStyleSheet("QFrame{color:#1e293b;}")
+        cp_vb.addWidget(_sep_lbl)
+
+        def _spin_row(label, lo, hi, default, suffix=""):
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color:#94a3b8;font-size:10px;")
+            lbl.setFixedWidth(80)
+            sb  = QSpinBox()
+            sb.setRange(lo, hi)
+            sb.setValue(default)
+            sb.setSuffix(suffix)
+            sb.setStyleSheet(
+                "QSpinBox{background:#0f172a;border:1px solid #334155;"
+                "border-radius:3px;color:#e2e8f0;font-size:10px;padding:2px;}")
+            row.addWidget(lbl)
+            row.addWidget(sb)
+            return row, sb
+
+        row_exp,  self._sb_exposure = _spin_row("노출 (μs)",  100, 10000, 1000, " μs")
+        row_gain, self._sb_gain     = _spin_row("게인 (dB)",    0,    32,    8, " dB")
+        row_wbr,  self._sb_wb_r    = _spin_row("WB Red",       0,   255,  128)
+        row_wbb,  self._sb_wb_b    = _spin_row("WB Blue",      0,   255,  128)
+
+        for row in [row_exp, row_gain, row_wbr, row_wbb]:
+            cp_vb.addLayout(row)
+
+        cp_vb.addSpacing(8)
+
+        btn_apply = QPushButton("✔ 적용")
+        btn_apply.setStyleSheet(
+            "QPushButton{background:#0ea5e9;border:none;border-radius:4px;"
+            "color:white;padding:6px;font-size:10px;}"
+            "QPushButton:hover{background:#38bdf8;}")
+        btn_apply.clicked.connect(self._apply_camera_settings)
+        cp_vb.addWidget(btn_apply)
+
+        self._btn_cam_rollback = QPushButton("↩ 롤백")
+        self._btn_cam_rollback.setStyleSheet(
+            "QPushButton{background:#1e293b;border:1px solid #334155;border-radius:4px;"
+            "color:#94a3b8;padding:6px;font-size:10px;}"
+            "QPushButton:hover{background:#334155;color:#e2e8f0;}")
+        self._btn_cam_rollback.setEnabled(False)
+        self._btn_cam_rollback.clicked.connect(self._rollback_camera_settings)
+        cp_vb.addWidget(self._btn_cam_rollback)
+
+        cp_vb.addStretch()
+        hb.addWidget(cam_panel)
         return w
 
     def _build_page_teach(self) -> QWidget:
@@ -841,6 +1036,18 @@ class InspectorApp(QMainWindow):
         self._run_timer.stop()
         prev = self._mode
         self._mode = mode
+
+        # P4-19: LIVE 진입 전 현재 설정 저장 / 이탈 시 롤백
+        if mode == "LIVE" and prev != "LIVE":
+            self._cam_settings_saved = self._current_cam_settings()
+            if hasattr(self, '_btn_cam_rollback'):
+                self._btn_cam_rollback.setEnabled(True)
+        elif prev == "LIVE" and mode != "LIVE":
+            # 롤백: 이전 카메라 설정 복원
+            if self._cam_settings_saved:
+                self._send_camera_settings(self._cam_settings_saved)
+            if hasattr(self, '_btn_cam_rollback'):
+                self._btn_cam_rollback.setEnabled(False)
 
         # 버튼 상태 동기화
         for btn, m in [(self._btn_live,  "LIVE"),
@@ -1180,6 +1387,52 @@ class InspectorApp(QMainWindow):
     def _on_overlay_changed(self):
         """파라미터 패널 변경 → UI Preview 즉시 재실행."""
         self._run_preview()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # P4-19: 카메라 설정 헬퍼
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _current_cam_settings(self) -> dict:
+        """현재 카메라 설정 패널 값 → dict."""
+        return {
+            'exposure': getattr(self, '_sb_exposure', None) and self._sb_exposure.value() or 1000,
+            'gain':     getattr(self, '_sb_gain',     None) and self._sb_gain.value()     or 8,
+            'wb_r':     getattr(self, '_sb_wb_r',     None) and self._sb_wb_r.value()     or 128,
+            'wb_b':     getattr(self, '_sb_wb_b',     None) and self._sb_wb_b.value()     or 128,
+        }
+
+    def _send_camera_settings(self, settings: dict):
+        """CMD_SET_CAMERA: exposure/gain/wb_r/wb_b → 장치 전송."""
+        if not self.link:
+            return
+        self.link.send_command(
+            HyProtocol.CMD_SET_CAMERA,
+            target_id=HyProtocol.DEV_CAMERA,
+            params=[
+                int(settings.get('exposure', 1000)),
+                int(settings.get('gain',     8)),
+                int(settings.get('wb_r',     128)),
+                int(settings.get('wb_b',     128)),
+            ],
+        )
+
+    def _apply_camera_settings(self):
+        """LIVE 패널 '✔ 적용' 버튼 핸들러."""
+        self._send_camera_settings(self._current_cam_settings())
+        self.log("카메라 설정 적용", "success")
+
+    def _rollback_camera_settings(self):
+        """LIVE 패널 '↩ 롤백' 버튼 핸들러 — 저장된 설정 복원."""
+        if self._cam_settings_saved is None:
+            return
+        s = self._cam_settings_saved
+        if hasattr(self, '_sb_exposure'):
+            self._sb_exposure.setValue(s.get('exposure', 1000))
+            self._sb_gain.setValue(    s.get('gain',     8))
+            self._sb_wb_r.setValue(    s.get('wb_r',     128))
+            self._sb_wb_b.setValue(    s.get('wb_b',     128))
+        self._send_camera_settings(s)
+        self.log("카메라 설정 롤백 완료")
 
     # ─────────────────────────────────────────────────────────────────────────
     # TEST 모드
