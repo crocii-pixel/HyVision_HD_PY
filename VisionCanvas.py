@@ -40,6 +40,10 @@ class VisionCanvas(QWidget):
     MODE_TEST    = "TEST"
     MODE_RUN     = "RUN"
 
+    # P4-02: 회전 핸들 설정
+    _ROT_HANDLE_OFFSET = 28   # ROI 상단 중앙으로부터 위쪽 오프셋 (px)
+    _ROT_HANDLE_RADIUS = 7    # 핸들 원 반지름 (px)
+
     # TEACH 모드에서 ROI 가 변경될 때 발행
     sig_roi_changed = pyqtSignal(int, float, float, float, float)   # tool_id, x,y,w,h
     # 툴 클릭됐을 때
@@ -63,9 +67,10 @@ class VisionCanvas(QWidget):
         self._panning    = False
         self._pan_origin = QPointF()
 
-        # TEACH 드래그 상태
-        self._drag_action = None   # None | "move" | "resize"
+        # TEACH 드래그 상태 (P4-01: Rotating 추가)
+        self._drag_action = None   # None | "move" | "resize" | "rotate"
         self._drag_offset = QPointF()
+        self._rotate_center_screen = QPointF()   # rotate 드래그 시 ROI 중심 화면 좌표
 
         # OSD 옵션
         self.show_roi_boxes    = True
@@ -191,6 +196,8 @@ class VisionCanvas(QWidget):
                 srect = self._screen_rect_of(tid)
                 if action == "move":
                     self._drag_offset = QPointF(event.pos()) - srect.topLeft()
+                elif action == "rotate":
+                    self._rotate_center_screen = srect.center()
                 self.sig_tool_selected.emit(tid)
             else:
                 self._active_tool_id = None
@@ -221,7 +228,8 @@ class VisionCanvas(QWidget):
         if not event.buttons():
             _, action = self._hit_test(QPointF(event.pos()))
             cursors = {"resize": Qt.SizeFDiagCursor,
-                       "move":   Qt.SizeAllCursor}
+                       "move":   Qt.SizeAllCursor,
+                       "rotate": Qt.PointingHandCursor}
             self.setCursor(cursors.get(action, Qt.ArrowCursor))
             return
 
@@ -243,6 +251,22 @@ class VisionCanvas(QWidget):
                 new_w   = max(20.0, pos.x() - srect.x())
                 new_h   = max(20.0, pos.y() - srect.y())
                 srect.setSize(QSizeF(new_w, new_h))
+            elif self._drag_action == "rotate":
+                # P4-02: 각도 = atan2(dy, dx) + 90° (상단=0°)
+                dx = pos.x() - self._rotate_center_screen.x()
+                dy = pos.y() - self._rotate_center_screen.y()
+                angle = math.degrees(math.atan2(dy, dx)) + 90.0
+                # -180..180 정규화
+                while angle > 180.0:
+                    angle -= 360.0
+                while angle < -180.0:
+                    angle += 360.0
+                tool.rot_angle = angle
+                roi = tool.search_roi
+                self.sig_roi_changed.emit(
+                    tool.tool_id, roi[0], roi[1], roi[2], roi[3])
+                self.update()
+                return
 
             roi = self._screen_to_roi(srect)
             tool.search_roi = (roi.x(), roi.y(), roi.width(), roi.height())
@@ -320,30 +344,69 @@ class VisionCanvas(QWidget):
             is_anchor = isinstance(tool, HyLocator)
             is_active = (tool.tool_id == self._active_tool_id)
             color     = C_ANCHOR if is_anchor else C_TOOL
+            angle     = getattr(tool, 'rot_angle', 0.0)
 
             # P4-03: anchor 보유 시 fixture 변환 적용 (앵커 자체 제외)
             use_tf = tf if (tool.use_anchor and not is_anchor) else None
             srect = self._roi_to_screen_fixtured(QRectF(*tool.search_roi), use_tf, cx, cy, s)
 
-            # ROI 사각형
+            # P4-02: ROI 사각형 (회전 적용)
             pen = QPen(color, 2 if is_active else 1,
                        Qt.SolidLine if is_active else Qt.DashLine)
-            p.setPen(pen)
             alpha = 50 if is_active else 0
-            p.setBrush(QColor(color.red(), color.green(), color.blue(), alpha))
-            p.drawRect(srect)
+            brush = QBrush(QColor(color.red(), color.green(), color.blue(), alpha))
+            center = srect.center()
+            if angle != 0.0:
+                p.save()
+                p.translate(center.x(), center.y())
+                p.rotate(angle)
+                p.translate(-center.x(), -center.y())
+                p.setPen(pen)
+                p.setBrush(brush)
+                p.drawRect(srect)
+                p.restore()
+            else:
+                p.setPen(pen)
+                p.setBrush(brush)
+                p.drawRect(srect)
 
             # 이름 라벨
             p.setPen(color)
             p.setFont(QFont("Segoe UI", 9))
-            p.drawText(srect.topLeft() + QPointF(4, -4), tool.name)
+            lbl_pos = self._rotate_point(
+                srect.topLeft() + QPointF(4, -4), center, angle)
+            p.drawText(lbl_pos, tool.name)
 
-            # 활성 도구: 리사이즈 핸들
+            # 활성 도구: 리사이즈 핸들 + 회전 핸들 (P4-02)
             if is_active:
-                corner = QRectF(srect.right() - 5, srect.bottom() - 5, 10, 10)
+                # 리사이즈 핸들 (우하단, 회전 적용)
+                br_rot = self._rotate_point(srect.bottomRight(), center, angle)
+                corner = QRectF(br_rot.x() - 5, br_rot.y() - 5, 10, 10)
                 p.setBrush(color)
                 p.setPen(Qt.NoPen)
                 p.drawRect(corner)
+
+                # 회전 핸들 연결선
+                top_center_rot = self._rotate_point(
+                    QPointF(center.x(), srect.top()), center, angle)
+                rot_hp = self._rot_handle_screen(srect, angle)
+                p.setPen(QPen(color, 1, Qt.DashLine))
+                p.setBrush(Qt.NoBrush)
+                p.drawLine(top_center_rot, rot_hp)
+
+                # 회전 핸들 원
+                p.setPen(QPen(C_SEL, 1.5))
+                p.setBrush(QColor(color.red(), color.green(), color.blue(), 200))
+                p.drawEllipse(rot_hp,
+                              float(self._ROT_HANDLE_RADIUS),
+                              float(self._ROT_HANDLE_RADIUS))
+
+                # 각도 텍스트 (0°가 아닐 때만)
+                if abs(angle) > 0.05:
+                    p.setPen(color)
+                    p.setFont(QFont("Consolas", 8))
+                    p.drawText(rot_hp + QPointF(self._ROT_HANDLE_RADIUS + 3, 4),
+                               f"{angle:.1f}°")
 
             # 결과 십자선 (미리보기)
             if self.show_result_cross and tool.rst_done == HyProtocol.EXEC_DONE:
@@ -494,29 +557,39 @@ class VisionCanvas(QWidget):
             return QRectF()
         return self._roi_to_screen(QRectF(*tool.search_roi), cx, cy, s)
 
-    def _corner_rect(self, srect: QRectF) -> QRectF:
-        return QRectF(srect.right() - 5, srect.bottom() - 5, 10, 10)
+    def _corner_rect(self, srect: QRectF, angle_deg: float = 0.0) -> QRectF:
+        """리사이즈 핸들 히트 박스 (우하단 꼭짓점 회전 후)."""
+        br = (self._rotate_point(srect.bottomRight(), srect.center(), angle_deg)
+              if angle_deg != 0.0 else srect.bottomRight())
+        return QRectF(br.x() - 5, br.y() - 5, 10, 10)
 
     def _hit_test(self, pos: QPointF):
-        """TEACH 모드 히트 테스트. (tool_id, action) | (None, None)."""
+        """TEACH 모드 히트 테스트. (tool_id, action) | (None, None).
+        우선순위: rotate > resize > move."""
         if self.recipe is None:
             return None, None
 
-        def _check(tool):
+        def _check(tool, check_rotate: bool = False):
             if not is_physical_tool(tool):
                 return None, None
             srect = self._screen_rect_of(tool.tool_id)
-            if self._corner_rect(srect).contains(pos):
+            angle = getattr(tool, 'rot_angle', 0.0)
+            # P4-02: 회전 핸들 (활성 툴에서만)
+            if check_rotate and self._rot_handle_rect(srect, angle).contains(pos):
+                return tool.tool_id, "rotate"
+            if self._corner_rect(srect, angle).contains(pos):
                 return tool.tool_id, "resize"
             if srect.contains(pos):
                 return tool.tool_id, "move"
             return None, None
 
-        # 활성 툴 우선
-        if self._active_tool_id and self.recipe.get_tool(self._active_tool_id):
-            tid, act = _check(self.recipe.get_tool(self._active_tool_id))
-            if tid is not None:
-                return tid, act
+        # 활성 툴 우선 (회전 핸들 포함)
+        if self._active_tool_id:
+            active = self.recipe.get_tool(self._active_tool_id)
+            if active:
+                tid, act = _check(active, check_rotate=True)
+                if tid is not None:
+                    return tid, act
 
         for tool in self.recipe.tool_index.values():
             tid, act = _check(tool)
@@ -524,6 +597,33 @@ class VisionCanvas(QWidget):
                 return tid, act
 
         return None, None
+
+    # ─── P4-02: 회전 핸들 헬퍼 ──────────────────────────────────────────────
+
+    @staticmethod
+    def _rotate_point(point: QPointF, center: QPointF, angle_deg: float) -> QPointF:
+        """point 를 center 주위로 angle_deg (CW+) 만큼 회전."""
+        if angle_deg == 0.0:
+            return point
+        rad = math.radians(angle_deg)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        dx, dy = point.x() - center.x(), point.y() - center.y()
+        return QPointF(
+            center.x() + dx * cos_a - dy * sin_a,
+            center.y() + dx * sin_a + dy * cos_a,
+        )
+
+    def _rot_handle_screen(self, srect: QRectF, angle_deg: float) -> QPointF:
+        """회전 핸들의 화면 좌표 (ROI 상단 중앙 + OFFSET 위쪽, 각도 회전 적용)."""
+        center   = srect.center()
+        unrot_hp = QPointF(center.x(), srect.top() - self._ROT_HANDLE_OFFSET)
+        return self._rotate_point(unrot_hp, center, angle_deg)
+
+    def _rot_handle_rect(self, srect: QRectF, angle_deg: float) -> QRectF:
+        """회전 핸들 히트 박스 (반지름 R 의 정사각형 근사)."""
+        hp = self._rot_handle_screen(srect, angle_deg)
+        r  = float(self._ROT_HANDLE_RADIUS)
+        return QRectF(hp.x() - r, hp.y() - r, r * 2, r * 2)
 
     def _draw_cross(self, p: QPainter, x: float, y: float, color: QColor,
                     size: float = 8.0):
