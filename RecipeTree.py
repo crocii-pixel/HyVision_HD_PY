@@ -57,8 +57,8 @@ class RecipeTree:
         if tool.tool_id in self.tool_index:
             raise ValueError(f"tool_id {tool.tool_id} already exists")
 
-        # 물리 비전 툴은 루트 금지
-        if is_physical_tool(tool) and parent_id == 0:
+        # 물리 비전 툴은 루트 금지 (단, HyLocator 앵커는 루트 허용 — 시스템 1개)
+        if is_physical_tool(tool) and parent_id == 0 and not isinstance(tool, HyLocator):
             raise ValueError("물리 비전 툴은 최상위(루트)에 배치할 수 없습니다. 로직 툴 내부에 넣어주세요.")
 
         tool.parent_id = parent_id
@@ -115,6 +115,48 @@ class RecipeTree:
             self.anchor = None
         return True
 
+    def add_ref(self, logic_id: int, vision_id: int) -> bool:
+        """P2-04: 로직 툴 → 비전 툴 참조 추가.
+        logic_id 로직 툴의 children 에 vision_id 툴을 삽입.
+        이미 참조 중이면 True 반환 (멱등).
+        """
+        logic = self.tool_index.get(logic_id)
+        vision = self.tool_index.get(vision_id)
+        if logic is None or vision is None:
+            return False
+        if not isinstance(logic, HyLogicTool):
+            raise ValueError(f"logic_id {logic_id} 는 로직 툴이어야 합니다.")
+        # 중복 방지
+        if any(c.tool_id == vision_id for c in logic.children):
+            return True
+        logic.add_child(vision)
+        vision.parent_id = logic_id
+        self.tool_index[vision_id] = vision
+        return True
+
+    def remove_ref(self, logic_id: int, vision_id: int) -> bool:
+        """P2-04: 로직 툴 → 비전 툴 참조 제거.
+        children 에서만 분리하고 tool_index 에는 유지 (툴 삭제 아님).
+        """
+        logic = self.tool_index.get(logic_id)
+        if logic is None or not isinstance(logic, HyLogicTool):
+            return False
+        if not any(c.tool_id == vision_id for c in logic.children):
+            return False
+        logic.remove_child(vision_id)
+        # parent_id 초기화 (최상위로 부유)
+        vision = self.tool_index.get(vision_id)
+        if vision:
+            vision.parent_id = 0
+        return True
+
+    def get_refs(self, logic_id: int) -> list:
+        """logic_id 로직 툴이 참조하는 비전 툴 목록 반환."""
+        logic = self.tool_index.get(logic_id)
+        if logic is None or not isinstance(logic, HyLogicTool):
+            return []
+        return list(logic.children)
+
     def get_tool(self, tool_id: int):
         return self.tool_index.get(tool_id)
 
@@ -164,10 +206,11 @@ class RecipeTree:
     # State Injection (Device Burst → PC 트리 상태 동기화)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def inject_burst(self, burst_packets: list, cycle_id: int):
+    def inject_burst(self, burst_packets: list, cycle_id: int, img_id: int = 0):
         """
         Device Burst (list[dict]) 를 받아 트리 노드에 State Injection.
         burst_packets 의 각 dict 는 HyProtocol.unpack_result() 결과.
+        _last_img_id/_last_cycle_id 를 함께 커밋해 evaluate() 에서 재실행 방지.
         """
         self.current_cycle_id = cycle_id
         for pkt in burst_packets:
@@ -177,6 +220,9 @@ class RecipeTree:
             tool = self.tool_index.get(tool_id)
             if tool:
                 tool.from_packet(pkt)
+                # 캐시 커밋: evaluate() 가 동일 img_id/cycle_id 로 호출 시 재실행 안 함
+                tool._last_img_id   = pkt.get('img_id', img_id)
+                tool._last_cycle_id = cycle_id
 
     # ─────────────────────────────────────────────────────────────────────────
     # PC 측 연산 재개 (device_id == DEV_PC 인 툴 실행)
