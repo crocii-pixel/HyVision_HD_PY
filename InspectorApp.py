@@ -682,11 +682,38 @@ class InspectorApp(QMainWindow):
         center = QWidget()
         center_vb = QVBoxLayout(center)
         center_vb.setContentsMargins(0, 0, 0, 0)
+
+        # P4-26: [+로직툴▼] 드롭다운 버튼
+        tree_header = QHBoxLayout()
         lbl2 = QLabel("로직 집행관 트리  (우클릭 → 노드 추가/삭제)")
         lbl2.setStyleSheet("color:#94a3b8;font-size:10px;font-weight:bold;padding:4px;")
+        tree_header.addWidget(lbl2, 1)
+
+        self._logic_add_menu = QMenu(self)
+        self._logic_add_menu.setStyleSheet(
+            "QMenu{background:#0f172a;border:1px solid #334155;color:#e2e8f0;}"
+            "QMenu::item:selected{background:#1e293b;}")
+        for ttype, tname, icon in [
+            (HyProtocol.TOOL_FIN,  "HyFin [Fin]",  "[Fin]"),
+            (HyProtocol.TOOL_AND,  "HyAnd",         "∧"),
+            (HyProtocol.TOOL_OR,   "HyOr",          "∨"),
+            (HyProtocol.TOOL_WHEN, "HyWhen",        "⏱"),
+        ]:
+            act = QAction(f"{icon}  {tname}", self)
+            act.triggered.connect(
+                lambda checked, tt=ttype: self._add_root_logic_tool(tt))
+            self._logic_add_menu.addAction(act)
+
+        btn_logic_add = _icon_btn("+ 로직툴  ▾", "루트 로직 툴 추가")
+        btn_logic_add.setFixedWidth(100)
+        btn_logic_add.clicked.connect(
+            lambda: self._logic_add_menu.exec_(
+                btn_logic_add.mapToGlobal(QPoint(0, btn_logic_add.height()))))
+        tree_header.addWidget(btn_logic_add)
+
+        center_vb.addLayout(tree_header)
         self._logic_tree = LogicTreeWidget(self.recipe)
         self._logic_tree.itemClicked.connect(self._on_tree_item_clicked)
-        center_vb.addWidget(lbl2)
         center_vb.addWidget(self._logic_tree, 1)
 
         splitter.addWidget(left)
@@ -1143,6 +1170,19 @@ class InspectorApp(QMainWindow):
             it = QListWidgetItem(f"{icon}  {t.name}  [id={t.tool_id}]")
             it.setData(Qt.UserRole, t.tool_id)
             self._phys_list.addItem(it)
+
+    def _add_root_logic_tool(self, tool_type: int):
+        """P4-26: TEST 모드 [+로직툴] 드롭다운 → 루트 로직 툴 추가."""
+        tid  = self.recipe.alloc_id()
+        tool = create_tool(tool_type, tid)
+        try:
+            self.recipe.add_tool(tool, parent_id=0)
+        except ValueError as e:
+            QMessageBox.warning(self, "추가 실패", str(e))
+            return
+        self._logic_tree.rebuild()
+        self._update_recipe_status()
+        self.log(f"로직 툴 추가: {tool.name} (id={tid})", "success")
 
     def _on_tree_item_clicked(self, item, col):
         tid  = item.data(0, Qt.UserRole)

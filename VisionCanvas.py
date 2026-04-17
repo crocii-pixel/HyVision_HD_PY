@@ -275,9 +275,31 @@ class VisionCanvas(QWidget):
         p.setFont(QFont("Segoe UI", 16))
         p.drawText(self.rect(), Qt.AlignCenter, "장치에 연결하거나 이미지 폴더를 선택하세요")
 
+    def _fixture_transform(self):
+        """RecipeTree.get_fixture_transform() 래퍼. 없으면 None."""
+        if self.recipe is None:
+            return None
+        try:
+            return self.recipe.get_fixture_transform()
+        except Exception:
+            return None
+
+    def _roi_to_screen_fixtured(self, roi: QRectF, tf, cx, cy, s) -> QRectF:
+        """P4-03: Fixture 변환 적용 후 화면 좌표. tf=None 이면 그대로."""
+        if tf is None or tf.isIdentity():
+            return self._roi_to_screen(roi, cx, cy, s)
+        center = QPointF(roi.x() + roi.width() / 2.0,
+                         roi.y() + roi.height() / 2.0)
+        center_t = tf.map(center)
+        return self._roi_to_screen(
+            QRectF(center_t.x() - roi.width() / 2.0,
+                   center_t.y() - roi.height() / 2.0,
+                   roi.width(), roi.height()), cx, cy, s)
+
     def _draw_teach(self, p: QPainter, cx, cy, s):
         if self.recipe is None:
             return
+        tf = self._fixture_transform()
         for tool in self.recipe.tool_index.values():
             if not is_physical_tool(tool):
                 continue
@@ -285,7 +307,9 @@ class VisionCanvas(QWidget):
             is_active = (tool.tool_id == self._active_tool_id)
             color     = C_ANCHOR if is_anchor else C_TOOL
 
-            srect = self._roi_to_screen(QRectF(*tool.search_roi), cx, cy, s)
+            # P4-03: anchor 보유 시 fixture 변환 적용 (앵커 자체 제외)
+            use_tf = tf if (tool.use_anchor and not is_anchor) else None
+            srect = self._roi_to_screen_fixtured(QRectF(*tool.search_roi), use_tf, cx, cy, s)
 
             # ROI 사각형
             pen = QPen(color, 2 if is_active else 1,
@@ -315,14 +339,16 @@ class VisionCanvas(QWidget):
     def _draw_live_overlay(self, p: QPainter, cx, cy, s):
         if self.recipe is None or not self.show_roi_boxes:
             return
+        tf = self._fixture_transform()
         for tool in self.recipe.tool_index.values():
             if not is_physical_tool(tool):
                 continue
             is_anchor = isinstance(tool, HyLocator)
             color = C_ANCHOR if is_anchor else C_TOOL
 
-            # Fixture 적용 ROI
-            srect = self._roi_to_screen(QRectF(*tool.search_roi), cx, cy, s)
+            # P4-03: Fixture 적용 ROI
+            use_tf = tf if (tool.use_anchor and not is_anchor) else None
+            srect = self._roi_to_screen_fixtured(QRectF(*tool.search_roi), use_tf, cx, cy, s)
             p.setPen(QPen(color, 1, Qt.DashLine))
             p.setBrush(Qt.NoBrush)
             p.drawRect(srect)
