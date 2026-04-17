@@ -73,6 +73,12 @@ class VisionCanvas(QWidget):
         self.show_status_box   = True
         self.show_spec_box     = True
 
+        # P4-04: OSD 드래그 상태 (None = 자동 위치)
+        self._osd_status_pos: QPointF | None = None   # Status Box 좌상단
+        self._osd_spec_pos:   QPointF | None = None   # Spec Box 좌상단
+        self._osd_drag_target: str | None = None       # "status" | "spec"
+        self._osd_drag_offset = QPointF()
+
         # Fit 버튼
         self._btn_fit = QPushButton("⛶", self)
         self._btn_fit.setFixedSize(32, 32)
@@ -147,6 +153,22 @@ class VisionCanvas(QWidget):
             self.setCursor(Qt.ClosedHandCursor)
             return
 
+        # P4-04: RUN 모드 OSD 드래그 시작
+        if self._mode == self.MODE_RUN and event.button() == Qt.LeftButton:
+            pos = QPointF(event.pos())
+            sr  = self._osd_status_rect()
+            spec_r = self._osd_spec_rect()
+            if sr is not None and sr.contains(pos):
+                self._osd_drag_target = "status"
+                self._osd_drag_offset = pos - sr.topLeft()
+                self.setCursor(Qt.SizeAllCursor)
+                return
+            if spec_r is not None and spec_r.contains(pos):
+                self._osd_drag_target = "spec"
+                self._osd_drag_offset = pos - spec_r.topLeft()
+                self.setCursor(Qt.SizeAllCursor)
+                return
+
         if self._mode == self.MODE_TEACH and event.button() == Qt.LeftButton:
             tid, action = self._hit_test(QPointF(event.pos()))
             if tid is not None:
@@ -166,6 +188,16 @@ class VisionCanvas(QWidget):
             delta = QPointF(event.pos()) - self._pan_origin
             self._pan       += delta
             self._pan_origin = QPointF(event.pos())
+            self.update()
+            return
+
+        # P4-04: OSD 박스 드래그
+        if self._osd_drag_target and event.buttons() & Qt.LeftButton:
+            new_tl = QPointF(event.pos()) - self._osd_drag_offset
+            if self._osd_drag_target == "status":
+                self._osd_status_pos = new_tl
+            elif self._osd_drag_target == "spec":
+                self._osd_spec_pos = new_tl
             self.update()
             return
 
@@ -209,6 +241,10 @@ class VisionCanvas(QWidget):
         if event.button() == Qt.RightButton:
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
+        if event.button() == Qt.LeftButton:
+            if self._osd_drag_target:
+                self._osd_drag_target = None
+                self.setCursor(Qt.ArrowCursor)
         self._drag_action = None
 
     # ─── 렌더링 ──────────────────────────────────────────────────────────────
@@ -301,6 +337,24 @@ class VisionCanvas(QWidget):
                 p.drawText(QPointF(cx + tool.x * s + 8, cy + tool.y * s - 4),
                            f"{tool.angle:.1f}°")
 
+    def _osd_status_rect(self) -> QRectF | None:
+        """Status Box 현재 위치 QRectF. recipe/fin 없으면 None."""
+        if self.recipe is None or not self.recipe.get_fin_tools():
+            return None
+        tl = self._osd_status_pos or QPointF(self.width() - 230, 10)
+        return QRectF(tl, QSizeF(220, 90))
+
+    def _osd_spec_rect(self) -> QRectF | None:
+        """Spec Box 현재 위치 QRectF. tools 없으면 None."""
+        if self.recipe is None:
+            return None
+        tools = self.recipe.get_physical_tools()
+        if not tools:
+            return None
+        box_h = 16 * len(tools) + 16
+        tl = self._osd_spec_pos or QPointF(10, self.height() - box_h - 10)
+        return QRectF(tl, QSizeF(300, box_h))
+
     def _draw_osd(self, p: QPainter):
         if self.recipe is None:
             return
@@ -308,24 +362,24 @@ class VisionCanvas(QWidget):
         if not fins:
             return
 
-        # Status Box (첫 HyFin 의 OK/NG)
+        # P4-04: Status Box — 드래그 가능 (좌상단 고정 기준)
         if self.show_status_box:
-            fin = fins[0]
+            fin   = fins[0]
             state = fin.rst_state
             color = JUDGE_COLOR.get(state, C_NG)
             text  = {HyProtocol.JUDGE_OK: "OK",
                      HyProtocol.JUDGE_NG: "NG",
                      HyProtocol.JUDGE_PENDING: "..."}.get(state, "?")
 
+            text_rect = self._osd_status_rect() or QRectF(self.width() - 230, 10, 220, 90)
             p.setFont(QFont("Segoe UI", 64, QFont.Bold))
             p.setPen(QPen(color, 2))
             p.setBrush(QColor(0, 0, 0, 160))
-            text_rect = QRectF(self.width() - 230, 10, 220, 90)
             p.drawRoundedRect(text_rect, 8, 8)
             p.setPen(color)
             p.drawText(text_rect, Qt.AlignCenter, text)
 
-        # Spec Box (모든 물리 툴 결과 목록)
+        # P4-04: Spec Box — 드래그 가능
         if self.show_spec_box:
             tools = self.recipe.get_physical_tools()
             if tools:
@@ -334,10 +388,11 @@ class VisionCanvas(QWidget):
                     st = {HyProtocol.JUDGE_OK: "OK",
                           HyProtocol.JUDGE_NG: "NG",
                           HyProtocol.JUDGE_PENDING: "..."}.get(t.rst_state, "?")
-                    lines.append(f"{t.name[:12]:12s}  {st}  ({t.x:.1f},{t.y:.1f})  {t.angle:.1f}°")
-                box_h   = 16 * len(lines) + 16
-                box_rect = QRectF(10, self.height() - box_h - 10,
-                                  300, box_h)
+                    lines.append(
+                        f"{t.name[:12]:12s}  {st}  ({t.x:.1f},{t.y:.1f})  {t.angle:.1f}°")
+                box_rect = self._osd_spec_rect() or QRectF(
+                    10, self.height() - len(lines) * 16 - 26, 300,
+                    16 * len(lines) + 16)
                 p.setBrush(QColor(0, 0, 0, 160))
                 p.setPen(Qt.NoPen)
                 p.drawRoundedRect(box_rect, 6, 6)

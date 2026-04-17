@@ -178,6 +178,19 @@ class LogicTreeWidget(QTreeWidget):
 
     def rebuild(self):
         self.clear()
+        # P4-12: 의존성 순서 검증 전 seq_id 채우기
+        try:
+            self.recipe.serialize_to_commands()
+            violations_raw = self.recipe.validate_dependency_order()
+            # 위반 tool_id 집합 추출 (이름 기반 파싱 대신 tool_index 전체 비교)
+            self._violation_ids = set()
+            for msg in violations_raw:
+                for tid, tool in self.recipe.tool_index.items():
+                    if tool.name and tool.name in msg:
+                        self._violation_ids.add(tid)
+        except Exception:
+            self._violation_ids = set()
+
         for root in self.recipe.root_nodes:
             item = self._make_item(root)
             self.addTopLevelItem(item)
@@ -186,9 +199,15 @@ class LogicTreeWidget(QTreeWidget):
 
     def _make_item(self, tool: HyTool) -> QTreeWidgetItem:
         icon = self.TOOL_TYPE_ICONS.get(tool.tool_type, "?")
-        name = f"{icon}  {tool.name}"
+        # P4-12: 의존성 위반 툴에 ⚠ 표시
+        warn = " ⚠" if getattr(self, '_violation_ids', set()) \
+            and tool.tool_id in self._violation_ids else ""
+        name = f"{icon}  {tool.name}{warn}"
         item = QTreeWidgetItem([name, "", ""])
         item.setData(0, Qt.UserRole, tool.tool_id)
+        if warn:
+            item.setForeground(0, QColor("#facc15"))
+            item.setToolTip(0, "의존성 순서 위반: 참조 툴보다 먼저 실행됩니다")
 
         state_color = {
             HyProtocol.JUDGE_OK:      "#10b981",
@@ -380,6 +399,7 @@ class InspectorApp(QMainWindow):
 
         # ─ 모드 상태 ──────────────────────────────────────────────────────────
         self._mode     = "STANDBY"   # STANDBY / LIVE / TEACH / TEST / RUN
+        self._submode  = "SET"       # "SET" (설정) | "VERIFY" (검증) — P4-25
         self._connected = False
 
         # ─ 주기 타이머 (TEST/RUN) ─────────────────────────────────────────────
@@ -446,6 +466,27 @@ class InspectorApp(QMainWindow):
             btn.clicked.connect(lambda checked, mode=m: self._set_mode(mode))
             btn.setEnabled(False)
             hb.addWidget(btn)
+
+        # P4-25: 서브모드 토글 (TEACH/TEST 모드에서만 표시)
+        hb.addSpacing(12)
+        _sub_ss = ("QPushButton{background:#0f172a;color:#64748b;font-size:11px;"
+                   "border:1px solid #1e293b;border-radius:4px;padding:4px 10px;}"
+                   "QPushButton:checked{background:#1e293b;color:#f1f5f9;"
+                   "border-color:#475569;}"
+                   "QPushButton:hover{border-color:#38bdf8;}")
+        self._btn_sub_set    = QPushButton("⚙ 설정")
+        self._btn_sub_verify = QPushButton("▶ 검증")
+        for b in (self._btn_sub_set, self._btn_sub_verify):
+            b.setCheckable(True)
+            b.setFixedHeight(28)
+            b.setStyleSheet(_sub_ss)
+            hb.addWidget(b)
+        self._btn_sub_set.setChecked(True)
+        self._btn_sub_set.clicked.connect(lambda: self._set_submode("SET"))
+        self._btn_sub_verify.clicked.connect(lambda: self._set_submode("VERIFY"))
+        # 초기에는 숨김 (연결 후 TEACH/TEST 모드에서만 표시)
+        self._btn_sub_set.setVisible(False)
+        self._btn_sub_verify.setVisible(False)
 
         hb.addStretch(1)
 
@@ -798,6 +839,13 @@ class InspectorApp(QMainWindow):
         }
         self._stack.setCurrentIndex(pages.get(mode, 0))
 
+        # P4-25: 서브모드 버튼 표시/숨김
+        has_sub = mode in ("TEACH", "TEST")
+        self._btn_sub_set.setVisible(has_sub)
+        self._btn_sub_verify.setVisible(has_sub)
+        if has_sub:
+            self._set_submode("SET")   # 모드 전환 시 설정 서브모드로 초기화
+
         # TEACH 모드 진입 시 툴 목록 갱신
         if mode == "TEACH":
             self._canvas_teach.set_mode("TEACH")
@@ -814,6 +862,40 @@ class InspectorApp(QMainWindow):
             self._sync_recipe_to_vm()
 
         self.log(f"모드 전환: {prev} → {mode}")
+
+    def _set_submode(self, submode: str):
+        """P4-25: 설정(SET) / 검증(VERIFY) 서브모드 전환."""
+        self._submode = submode
+        self._btn_sub_set.setChecked(submode == "SET")
+        self._btn_sub_verify.setChecked(submode == "VERIFY")
+
+        if self._mode == "TEACH":
+            if submode == "SET":
+                # TEACH 설정: 단일 프레임, ROI 편집 가능
+                self._canvas_teach.set_mode("TEACH")
+                if self.link:
+                    self.link.send_command(HyProtocol.CMD_TEACH_SNAP)
+                    self._run_timer.stop()
+            elif submode == "VERIFY":
+                # TEACH 검증: 동영상 스트리밍, ROI 잠금 (LIVE 뷰)
+                self._canvas_teach.set_mode("LIVE")
+                if self.link:
+                    self.link.send_command(HyProtocol.CMD_LIVE)
+                    self._run_timer.start(100)
+
+        elif self._mode == "TEST":
+            if submode == "SET":
+                # TEST 설정: 단일 프레임, 로직 트리 편집
+                if self.link:
+                    self.link.send_command(HyProtocol.CMD_TEACH_SNAP)
+                    self._run_timer.stop()
+            elif submode == "VERIFY":
+                # TEST 검증: 동영상 + 실시간 로직 평가
+                if self.link:
+                    self.link.send_command(HyProtocol.CMD_TEST)
+                    self._run_timer.start(50)
+
+        self.log(f"서브모드: {self._mode}/{submode}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # 장치 통신 콜백
