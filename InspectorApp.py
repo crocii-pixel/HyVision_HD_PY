@@ -27,7 +27,7 @@ from RecipeTree    import RecipeTree
 from VirtualMachine import VirtualMachine, FolderProvider, LiveCameraProvider
 from HyLink        import HyLink
 from VisionCanvas  import VisionCanvas
-from OverlayPanel  import OverlayPanel
+from OverlayPanel  import OverlayPanel, OverlayPanelManager
 from StatusIndicator import StatusIndicator
 
 
@@ -654,10 +654,9 @@ class InspectorApp(QMainWindow):
         list_vb.addWidget(btn_del)
         right_vb.addWidget(grp_list, 1)
 
-        # 오버레이 패널
-        self._overlay = OverlayPanel(self._canvas_teach)
+        # 오버레이 패널 매니저 (P4-15: 최대 4개 동시 패널)
+        self._overlay = OverlayPanelManager(self._canvas_teach)
         self._overlay.sig_updated.connect(self._on_overlay_changed)
-        self._overlay.sig_closed.connect(lambda: self._canvas_teach.set_active_tool(None))
 
         hb.addWidget(self._canvas_teach, 1)
         hb.addWidget(right)
@@ -1102,7 +1101,7 @@ class InspectorApp(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self, "삭제 실패", str(e))
             return
-        self._overlay.hide_panel()
+        self._overlay.hide_all_unpinned()
         self._canvas_teach.set_active_tool(None)
         self._refresh_teach_list()
         self._sync_recipe_to_vm()
@@ -1149,7 +1148,7 @@ class InspectorApp(QMainWindow):
 
     def _on_tool_selected_teach(self, tool_id: int):
         if tool_id < 0:
-            self._overlay.hide_panel()
+            self._overlay.hide_all_unpinned()
             return
         tool = self.recipe.get_tool(tool_id)
         if tool:
