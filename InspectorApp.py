@@ -28,6 +28,7 @@ from VirtualMachine import VirtualMachine, FolderProvider, LiveCameraProvider
 from HyLink        import HyLink
 from VisionCanvas  import VisionCanvas
 from OverlayPanel  import OverlayPanel
+from StatusIndicator import StatusIndicator
 
 
 # ─── 공통 스타일 ─────────────────────────────────────────────────────────────
@@ -324,6 +325,38 @@ class LogicTreeWidget(QTreeWidget):
             QMessageBox.warning(self, "삭제 실패", str(e))
         self.rebuild()
 
+    # ─── P4-11 키보드 단축키 ────────────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        item = self.currentItem()
+
+        if event.key() == Qt.Key_Delete and item:
+            # Del — 선택 툴 삭제
+            tid = item.data(0, Qt.UserRole)
+            if tid is not None:
+                self._delete_tool(tid)
+
+        elif event.key() == Qt.Key_Escape:
+            # Esc — 선택 해제
+            self.clearSelection()
+            self.setCurrentItem(None)
+
+        elif event.key() == Qt.Key_F2 and item:
+            # F2 — 인라인 이름 편집 (QTreeWidget 편집 모드)
+            self.editItem(item, 0)
+
+        elif event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_F:
+            # Ctrl+F — 첫 번째 HyFin 노드로 포커스 이동
+            for i in range(self.topLevelItemCount()):
+                root = self.topLevelItem(i)
+                if root and root.text(0).startswith("[Fin]"):
+                    self.setCurrentItem(root)
+                    self.scrollToItem(root)
+                    break
+
+        else:
+            super().keyPressEvent(event)
+
 
 # =============================================================================
 # InspectorApp — 메인 윈도우
@@ -435,13 +468,15 @@ class InspectorApp(QMainWindow):
         self._btn_connect.setCheckable(True)
         self._btn_connect.clicked.connect(self._on_connect_toggle)
 
-        # 상태 LED (텍스트)
-        self._lbl_status = QLabel("● DISCONNECTED")
+        # 상태 LED (P4-30 StatusIndicator)
+        self._status_led = StatusIndicator(size=18)
+        self._lbl_status = QLabel("DISCONNECTED")
         self._lbl_status.setStyleSheet("color:#ef4444;font-weight:bold;font-size:11px;")
 
         hb.addWidget(self._cmb_port)
         hb.addWidget(self._btn_refresh)
         hb.addWidget(self._btn_connect)
+        hb.addWidget(self._status_led)
         hb.addWidget(self._lbl_status)
 
         # P4-27: 레시피 저장/로드 버튼
@@ -834,15 +869,40 @@ class InspectorApp(QMainWindow):
         self._cmb_port.setEnabled(not connected)
         self._btn_refresh.setEnabled(not connected)
 
-        if connected:
-            self._lbl_status.setText("● CONNECTED")
+        # P4-30: StatusIndicator LED 업데이트
+        self._status_led.set_state(state)
+
+        if state == 1:
+            self._lbl_status.setText("CONNECTED")
             self._lbl_status.setStyleSheet("color:#10b981;font-weight:bold;font-size:11px;")
+        elif state == 2:
+            self._run_timer.stop()
+            self.log("장치 연결 비정상 종료 — VVM 자동 전환 중…", "warn")
+            # P4-28: Hot-Swap — 물리 → VVM 자동 전환
+            QTimer.singleShot(200, self._auto_switch_to_vvm)
         else:
-            self._lbl_status.setText("● DISCONNECTED")
+            self._lbl_status.setText("DISCONNECTED")
             self._lbl_status.setStyleSheet("color:#ef4444;font-weight:bold;font-size:11px;")
             self._run_timer.stop()
-            if state == 2:
-                self.log("장치 연결 비정상 종료", "error")
+
+    def _auto_switch_to_vvm(self):
+        """P4-28: 물리 연결 비정상 시 VVM 자동 전환."""
+        # 이미 VVM 모드면 무시 (재진입 방지)
+        if self.vm is not None:
+            return
+        provider = FolderProvider("")   # 이미지 없는 빈 VVM — 레시피 작업 유지
+        self.vm   = VirtualMachine(provider)
+        self.link = HyLink()
+        self.link.sig_log.connect(self.log)
+        self.link.sig_frame.connect(self._on_frame)
+        self.link.sig_connected.connect(self._on_connected)
+        self.link.connect_virtual(self.vm)
+        self._status_led.set_state(StatusIndicator.VVM)
+        self._lbl_status.setText("VVM 모드")
+        self._lbl_status.setStyleSheet("color:#3b82f6;font-weight:bold;font-size:11px;")
+        self.log("Hot-Swap 완료: VVM 모드", "system")
+        self._cmb_port.insertItem(0, "🔄 VVM (자동전환)", ("virtual", "auto"))
+        self._cmb_port.setCurrentIndex(0)
 
     # ─────────────────────────────────────────────────────────────────────────
     # TEACH 모드 - 툴 CRUD
