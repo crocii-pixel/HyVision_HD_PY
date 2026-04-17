@@ -397,6 +397,11 @@ class InspectorApp(QMainWindow):
         # ─ 레시피 저장 상태 (P4-27) ──────────────────────────────────────────
         self._recipe_path: str | None = None  # 현재 열린 .hyv 파일 경로
 
+        # ─ RUN 모드 지표 (P4-24) ─────────────────────────────────────────────
+        self._run_total = 0
+        self._run_ok    = 0
+        self._run_ng    = 0
+
         # ─ 모드 상태 ──────────────────────────────────────────────────────────
         self._mode     = "STANDBY"   # STANDBY / LIVE / TEACH / TEST / RUN
         self._submode  = "SET"       # "SET" (설정) | "VERIFY" (검증) — P4-25
@@ -866,6 +871,19 @@ class InspectorApp(QMainWindow):
         }
         self._stack.setCurrentIndex(pages.get(mode, 0))
 
+        # P4-24: RUN 모드 편집 잠금 / 해제
+        is_run = (mode == "RUN")
+        # TEACH 패널 CRUD 버튼 잠금
+        if hasattr(self, '_btn_sub_set'):
+            for w in (self._btn_recipe_save, self._btn_recipe_saveas,
+                      self._btn_recipe_open):
+                w.setEnabled(not is_run)
+        if is_run:
+            # 지표 초기화
+            self._run_total = 0
+            self._run_ok    = 0
+            self._run_ng    = 0
+
         # P4-25: 서브모드 버튼 표시/숨김
         has_sub = mode in ("TEACH", "TEST")
         self._btn_sub_set.setVisible(has_sub)
@@ -962,6 +980,16 @@ class InspectorApp(QMainWindow):
             # TEST 모드: 트리 상태 업데이트
             if self._mode == "TEST":
                 self._logic_tree.rebuild()
+            # P4-24: RUN 모드 지표 누적 + canvas 에 전달
+            if self._mode == "RUN" and burst_results:
+                judgment = self.recipe.find_fin_judgment()
+                self._run_total += 1
+                if judgment == HyProtocol.JUDGE_OK:
+                    self._run_ok += 1
+                elif judgment == HyProtocol.JUDGE_NG:
+                    self._run_ng += 1
+                self._canvas_run.set_run_metrics(
+                    self._run_total, self._run_ok, self._run_ng)
 
     def _on_run_tick(self):
         """TEST/RUN 타이머 — 주기적 결과 요청."""

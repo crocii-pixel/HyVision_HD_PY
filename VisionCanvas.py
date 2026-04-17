@@ -79,6 +79,11 @@ class VisionCanvas(QWidget):
         self._osd_drag_target: str | None = None       # "status" | "spec"
         self._osd_drag_offset = QPointF()
 
+        # P4-24: RUN 모드 지표
+        self._run_total = 0
+        self._run_ok    = 0
+        self._run_ng    = 0
+
         # Fit 버튼
         self._btn_fit = QPushButton("⛶", self)
         self._btn_fit.setFixedSize(32, 32)
@@ -105,6 +110,15 @@ class VisionCanvas(QWidget):
     def set_mode(self, mode: str):
         self._mode = mode
         self._active_tool_id = None
+        if mode != self.MODE_RUN:
+            self._run_total = self._run_ok = self._run_ng = 0
+        self.update()
+
+    def set_run_metrics(self, total: int, ok: int, ng: int):
+        """P4-24: RUN 모드 지표 갱신 → 다음 paintEvent 에서 반영."""
+        self._run_total = total
+        self._run_ok    = ok
+        self._run_ng    = ng
         self.update()
 
     def set_active_tool(self, tool_id):
@@ -427,6 +441,27 @@ class VisionCanvas(QWidget):
                     p.setPen(C_OK)
                     p.drawText(QPointF(box_rect.x() + 8,
                                        box_rect.y() + 14 + i * 16), line)
+
+        # P4-24: RUN 모드 지표 (우하단)
+        if self._mode == self.MODE_RUN and self._run_total > 0:
+            ng_rate = self._run_ng / self._run_total * 100.0
+            metrics = [
+                f"TOTAL  {self._run_total:>6}",
+                f"OK     {self._run_ok:>6}  ({100-ng_rate:5.1f}%)",
+                f"NG     {self._run_ng:>6}  ({ng_rate:5.1f}%)",
+            ]
+            m_h = 16 * len(metrics) + 12
+            m_w = 200
+            m_rect = QRectF(self.width() - m_w - 10,
+                            self.height() - m_h - 10, m_w, m_h)
+            p.setBrush(QColor(0, 0, 0, 160))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(m_rect, 6, 6)
+            p.setFont(QFont("Consolas", 9))
+            for i, line in enumerate(metrics):
+                color = C_OK if i == 1 else (C_NG if i == 2 else QColor("#94a3b8"))
+                p.setPen(color)
+                p.drawText(QPointF(m_rect.x() + 8, m_rect.y() + 14 + i * 16), line)
 
     # ─── 내부 헬퍼 ──────────────────────────────────────────────────────────
 
