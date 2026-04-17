@@ -4,6 +4,7 @@ I-02  HyLink Flow Control — 큐 깊이 3 초과 → Drop (크래시 없음)
 I-03  HyLink Heartbeat — 3회 Timeout → sig_connected(2)
 I-04  RecipeTree + HyVisionTools — evaluate() 비전툴 실행 + 로직 평가
 I-05  Fixture 렌더링 — get_fixture_transform() 좌표 변환 픽셀 오차 ≤ 1px
+I-07  레시피 저장/로드 — .hyv 직렬화→역직렬화 CRC 검증 + 구조 완벽 복원
 """
 import sys
 import os
@@ -265,6 +266,135 @@ class TestEvaluate:
 # ─────────────────────────────────────────────────────────────────────────────
 # I-05  Fixture get_fixture_transform() — 좌표 변환 오차 ≤ 1px
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# I-07  레시피 저장/로드 — .hyv CRC + 구조 복원
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRecipePersistence:
+    """P3-01/02: save_to_file / load_from_file 라운드트립 검증."""
+
+    def _build_tree(self):
+        """HyLocator(1) + HyFin(2) → HyAnd(3) → HyLine(4) 구조."""
+        from HyVisionTools import HyLocator, HyFin, HyAnd, HyLine, HyWhen
+        tree = RecipeTree()
+
+        loc  = HyLocator(tool_id=1)
+        loc.search_roi      = (10, 20, 100, 80)
+        loc.update_policy   = HyLocator.UPDATE_CYCLE_LOCK
+        loc.allow_angle_range = (-45.0, 45.0)
+
+        fin  = HyFin(tool_id=2)
+        and_ = HyAnd(tool_id=3)
+        line = HyLine(tool_id=4)
+        line.search_roi = (50, 60, 200, 120)
+        line.rot_angle  = 30.0
+
+        and_.add_child(line)
+        fin.add_child(and_)
+
+        tree.add_tool(loc,  parent_id=0)
+        tree.add_tool(fin,  parent_id=0)
+        tree.add_tool(and_, parent_id=fin.tool_id)
+        tree.add_tool(line, parent_id=and_.tool_id)
+        return tree
+
+    def test_dirty_flag_set_on_add(self):
+        """add_tool 시 dirty 플래그 True."""
+        tree = RecipeTree()
+        assert not tree.dirty
+        tree.add_tool(HyFin(tool_id=1), parent_id=0)
+        assert tree.dirty
+
+    def test_roundtrip_structure(self, tmp_path):
+        """저장 → 로드 후 tool_index 키 집합 동일."""
+        tree = self._build_tree()
+        path = str(tmp_path / "recipe.hyv")
+
+        ok = tree.save_to_file(path)
+        assert ok, "save_to_file 실패"
+        assert not tree.dirty, "저장 후 dirty=False 기대"
+
+        tree2 = RecipeTree()
+        ok2 = tree2.load_from_file(path)
+        assert ok2, "load_from_file 실패"
+        assert not tree2.dirty, "로드 후 dirty=False 기대"
+
+        assert set(tree.tool_index.keys()) == set(tree2.tool_index.keys()), \
+            "tool_id 집합 불일치"
+
+    def test_roundtrip_roi(self, tmp_path):
+        """저장 → 로드 후 search_roi 값 동일."""
+        tree = self._build_tree()
+        path = str(tmp_path / "recipe.hyv")
+        tree.save_to_file(path)
+
+        tree2 = RecipeTree()
+        tree2.load_from_file(path)
+
+        t_orig = tree.tool_index[4]
+        t_load = tree2.tool_index[4]
+        for a, b in zip(t_orig.search_roi, t_load.search_roi):
+            assert abs(a - b) < 0.01, f"ROI 불일치: {a} vs {b}"
+        assert abs(t_orig.rot_angle - t_load.rot_angle) < 0.001
+
+    def test_roundtrip_anchor(self, tmp_path):
+        """저장 → 로드 후 anchor tool_id 동일."""
+        tree = self._build_tree()
+        path = str(tmp_path / "recipe.hyv")
+        tree.save_to_file(path)
+
+        tree2 = RecipeTree()
+        tree2.load_from_file(path)
+
+        assert tree2.anchor is not None, "anchor 복원 실패"
+        assert tree2.anchor.tool_id == tree.anchor.tool_id
+
+    def test_roundtrip_locator_extra(self, tmp_path):
+        """HyLocator update_policy·allow_angle_range 복원 검증."""
+        from HyVisionTools import HyLocator
+        tree = self._build_tree()
+        path = str(tmp_path / "recipe.hyv")
+        tree.save_to_file(path)
+
+        tree2 = RecipeTree()
+        tree2.load_from_file(path)
+
+        loc2 = tree2.tool_index[1]
+        assert isinstance(loc2, HyLocator)
+        assert loc2.update_policy == HyLocator.UPDATE_CYCLE_LOCK
+        assert abs(loc2.allow_angle_range[0] - (-45.0)) < 0.001
+        assert abs(loc2.allow_angle_range[1] - 45.0)    < 0.001
+
+    def test_crc_corruption_rejected(self, tmp_path):
+        """파일 마지막 바이트 변조 시 load_from_file → False."""
+        tree = self._build_tree()
+        path = str(tmp_path / "bad.hyv")
+        tree.save_to_file(path)
+
+        # 마지막 바이트를 반전시켜 CRC 깨트림
+        with open(path, 'r+b') as fh:
+            fh.seek(-1, 2)
+            b = fh.read(1)[0]
+            fh.seek(-1, 2)
+            fh.write(bytes([b ^ 0xFF]))
+
+        tree2 = RecipeTree()
+        assert not tree2.load_from_file(path), "변조된 파일을 로드해선 안 됨"
+
+    def test_root_nodes_count(self, tmp_path):
+        """저장 → 로드 후 root_nodes 수 동일."""
+        tree = self._build_tree()
+        path = str(tmp_path / "recipe.hyv")
+        tree.save_to_file(path)
+
+        tree2 = RecipeTree()
+        tree2.load_from_file(path)
+
+        # 원본: loc(root) + fin(root) = 2, and_/line 은 children
+        assert len(tree2.root_nodes) == len(tree.root_nodes), \
+            f"root_nodes 수 불일치: {len(tree2.root_nodes)} vs {len(tree.root_nodes)}"
+
 
 class TestFixtureTransform:
     def test_no_anchor_returns_identity(self):

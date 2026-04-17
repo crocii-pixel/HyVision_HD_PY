@@ -3,6 +3,9 @@ RecipeTree.py - DCOM 집행관 트리 및 레시피 관리 (v2.0)
 단순 dict 목록 → 계층적 집행관 트리로 격상.
 """
 import math
+import json
+import struct
+import zlib
 import numpy as np
 
 try:
@@ -15,6 +18,61 @@ from HyProtocol import HyProtocol
 from HyVisionTools import (HyTool, HyLogicTool, HyLocator,
                             HyWhen, HyAnd, HyOr, HyFin,
                             create_tool, is_logic_tool, is_physical_tool)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .hyv 바이너리 포맷 상수 (P3-01/02)
+# MAGIC(4) version(4) n_tools(4) anchor_id(4) next_id(4)
+# + N × [tool_id(H) tool_type(H) parent_id(H) device_id(H) seq_id(I)
+#          roi×4(4f) rot_angle(f) name_len(H) name(utf-8)
+#          extra_len(H) extra_json(utf-8)] + crc32(4)
+# ─────────────────────────────────────────────────────────────────────────────
+_HYV_MAGIC    = b'HYV1'
+_HYV_VERSION  = 1
+_HYV_HDR_FMT  = '<4sIIII'      # magic version n_tools anchor_id next_id
+_HYV_HDR_SIZE = struct.calcsize(_HYV_HDR_FMT)  # 20
+_HYV_TOOL_FMT  = '<HHHHIfffffH' # ids seq_id roi rot_angle name_len
+_HYV_TOOL_SIZE = struct.calcsize(_HYV_TOOL_FMT) # 34
+
+
+def _tool_extra(tool: HyTool) -> dict:
+    """툴 타입별 직렬화 추가 속성 반환 (JSON 호환 dict)."""
+    d: dict = {}
+    if isinstance(tool, HyLocator):
+        d['update_policy'] = getattr(tool, 'update_policy', HyLocator.UPDATE_CYCLE_LOCK)
+        ar = getattr(tool, 'allow_rect', None)
+        d['allow_rect'] = list(ar) if ar is not None else None
+        d['allow_angle_range'] = list(getattr(tool, 'allow_angle_range', (-180.0, 180.0)))
+    elif isinstance(tool, HyWhen):
+        d['watch_tool_id'] = int(getattr(tool, 'watch_tool_id', 0))
+        d['timeout_ms']    = int(getattr(tool, 'timeout_ms', 0))
+    elif isinstance(tool, HyFin):
+        raw = getattr(tool, 'io_mapping', {})
+        d['io_mapping']       = {str(k): v for k, v in raw.items()}
+        d['broadcast_target'] = getattr(tool, 'broadcast_target', 'status_box')
+    return d
+
+
+def _apply_tool_extra(tool: HyTool, extra: dict) -> None:
+    """저장된 dict를 툴 타입별 추가 속성으로 복원."""
+    if isinstance(tool, HyLocator):
+        tool.update_policy = extra.get('update_policy', HyLocator.UPDATE_CYCLE_LOCK)
+        ar = extra.get('allow_rect')
+        tool.allow_rect = tuple(ar) if ar is not None else None
+        rng = extra.get('allow_angle_range', [-180.0, 180.0])
+        tool.allow_angle_range = tuple(rng)
+    elif isinstance(tool, HyWhen):
+        tool.watch_tool_id = int(extra.get('watch_tool_id', 0))
+        tool.timeout_ms    = int(extra.get('timeout_ms', 0))
+    elif isinstance(tool, HyFin):
+        raw = extra.get('io_mapping', {})
+        # JSON은 정수 키를 문자열로 저장 — int 변환 시도
+        tool.io_mapping = {}
+        for k, v in raw.items():
+            try:
+                tool.io_mapping[int(k)] = v
+            except (ValueError, TypeError):
+                tool.io_mapping[k] = v
+        tool.broadcast_target = extra.get('broadcast_target', 'status_box')
 
 
 class RecipeTree:
@@ -30,6 +88,12 @@ class RecipeTree:
         self.anchor: HyLocator | None = None     # 단일 마스터 앵커 (시스템에 1개)
         self.current_cycle_id     = 0
         self._next_id             = 1            # 자동 증가 ID
+        self._dirty               = False        # P3-04: 미저장 변경 플래그
+
+    @property
+    def dirty(self) -> bool:
+        """P3-04: 마지막 저장/로드 이후 수정 여부."""
+        return self._dirty
 
     # ─────────────────────────────────────────────────────────────────────────
     # ID 관리
@@ -79,6 +143,7 @@ class RecipeTree:
         if isinstance(tool, HyLocator):
             self.anchor = tool
 
+        self._dirty = True
         return tool
 
     def remove_tool(self, tool_id: int) -> bool:
@@ -113,6 +178,7 @@ class RecipeTree:
         del self.tool_index[tool_id]
         if self.anchor and self.anchor.tool_id == tool_id:
             self.anchor = None
+        self._dirty = True
         return True
 
     def add_ref(self, logic_id: int, vision_id: int) -> bool:
@@ -132,6 +198,7 @@ class RecipeTree:
         logic.add_child(vision)
         vision.parent_id = logic_id
         self.tool_index[vision_id] = vision
+        self._dirty = True
         return True
 
     def remove_ref(self, logic_id: int, vision_id: int) -> bool:
@@ -148,6 +215,7 @@ class RecipeTree:
         vision = self.tool_index.get(vision_id)
         if vision:
             vision.parent_id = 0
+        self._dirty = True
         return True
 
     def get_refs(self, logic_id: int) -> list:
@@ -165,6 +233,7 @@ class RecipeTree:
         self.tool_index.clear()
         self.anchor = None
         self._next_id = 1
+        self._dirty = False
 
     # ─────────────────────────────────────────────────────────────────────────
     # DFS 직렬화 → SET_TOOL 명령 배열
@@ -398,6 +467,171 @@ class RecipeTree:
         """모든 툴 상태 초기화 (새 사이클 시작용)."""
         for tool in self.tool_index.values():
             tool.reset_state()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # P3-01  레시피 파일 저장 (.hyv 바이너리)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def save_to_file(self, path: str) -> bool:
+        """
+        P3-01: 현재 트리를 .hyv 바이너리 파일로 저장.
+        성공 시 True, OS 오류 시 False 반환. 성공 시 dirty 플래그 클리어.
+        """
+        tools     = list(self.tool_index.values())
+        anchor_id = self.anchor.tool_id if self.anchor else 0
+
+        buf = bytearray()
+
+        # 헤더
+        buf += struct.pack(_HYV_HDR_FMT,
+                           _HYV_MAGIC, _HYV_VERSION,
+                           len(tools), anchor_id, self._next_id)
+
+        # 툴 레코드
+        for tool in tools:
+            rx, ry, rw, rh = (float(v) for v in tool.search_roi)
+            name_b  = tool.name.encode('utf-8') if hasattr(tool, 'name') else b''
+            extra_b = json.dumps(_tool_extra(tool),
+                                 ensure_ascii=False).encode('utf-8')
+
+            buf += struct.pack(_HYV_TOOL_FMT,
+                               tool.tool_id & 0xFFFF,
+                               tool.tool_type & 0xFFFF,
+                               tool.parent_id & 0xFFFF,
+                               tool.device_id & 0xFFFF,
+                               getattr(tool, 'seq_id', 0),
+                               rx, ry, rw, rh,
+                               getattr(tool, 'rot_angle', 0.0),
+                               len(name_b))
+            buf += name_b
+            buf += struct.pack('<H', len(extra_b))
+            buf += extra_b
+
+        # CRC32 (전체 페이로드 기반)
+        crc = zlib.crc32(buf) & 0xFFFF_FFFF
+        buf += struct.pack('<I', crc)
+
+        try:
+            with open(path, 'wb') as fh:
+                fh.write(buf)
+            self._dirty = False
+            return True
+        except OSError:
+            return False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # P3-02  레시피 파일 로드 (.hyv 바이너리)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def load_from_file(self, path: str) -> bool:
+        """
+        P3-02: .hyv 파일에서 레시피 로드. CRC 검증 포함.
+        성공 시 현재 트리를 교체하고 True 반환.
+        실패(파일 없음·손상·CRC 불일치) 시 현재 상태 유지하고 False 반환.
+        """
+        try:
+            with open(path, 'rb') as fh:
+                data = fh.read()
+        except OSError:
+            return False
+
+        MIN_SIZE = _HYV_HDR_SIZE + 4   # 헤더 + CRC
+        if len(data) < MIN_SIZE:
+            return False
+
+        # CRC 검증
+        stored_crc   = struct.unpack_from('<I', data, len(data) - 4)[0]
+        computed_crc = zlib.crc32(data[:-4]) & 0xFFFF_FFFF
+        if stored_crc != computed_crc:
+            return False
+
+        # 헤더 파싱
+        magic, version, n_tools, anchor_id, next_id = \
+            struct.unpack_from(_HYV_HDR_FMT, data, 0)
+        if magic != _HYV_MAGIC or version != _HYV_VERSION:
+            return False
+
+        # 툴 레코드 파싱
+        offset = _HYV_HDR_SIZE
+        loaded: list = []
+        for _ in range(n_tools):
+            if offset + _HYV_TOOL_SIZE > len(data) - 4:
+                return False
+            fields = struct.unpack_from(_HYV_TOOL_FMT, data, offset)
+            offset += _HYV_TOOL_SIZE
+
+            (tool_id, tool_type, parent_id, device_id, seq_id,
+             rx, ry, rw, rh, rot_angle, name_len) = fields
+
+            if offset + name_len > len(data) - 4:
+                return False
+            name = data[offset:offset + name_len].decode('utf-8', errors='replace')
+            offset += name_len
+
+            if offset + 2 > len(data) - 4:
+                return False
+            extra_len = struct.unpack_from('<H', data, offset)[0]
+            offset += 2
+
+            if offset + extra_len > len(data) - 4:
+                return False
+            extra_raw = data[offset:offset + extra_len]
+            extra = json.loads(extra_raw) if extra_len > 0 else {}
+            offset += extra_len
+
+            loaded.append({
+                'tool_id':   tool_id,
+                'tool_type': tool_type,
+                'parent_id': parent_id,
+                'device_id': device_id,
+                'seq_id':    seq_id,
+                'roi':       (rx, ry, rw, rh),
+                'rot_angle': rot_angle,
+                'name':      name,
+                'extra':     extra,
+            })
+
+        # 트리 재구성 — 현재 트리를 먼저 클리어
+        self.clear()
+        self._next_id = next_id
+
+        # Pass 1: 모든 툴 오브젝트 생성
+        tool_objs: dict = {}
+        for td in loaded:
+            try:
+                t = create_tool(td['tool_type'], td['tool_id'])
+            except ValueError:
+                return False           # 알 수 없는 tool_type
+            t.device_id  = td['device_id']
+            t.seq_id     = td['seq_id']
+            t.search_roi = td['roi']
+            t.rot_angle  = td['rot_angle']
+            if td['name'] and hasattr(t, 'name'):
+                t.name = td['name']
+            _apply_tool_extra(t, td['extra'])
+            tool_objs[t.tool_id] = t
+
+        # Pass 2: 트리 구조 연결
+        for td in loaded:
+            t = tool_objs[td['tool_id']]
+            t.parent_id = td['parent_id']
+            self.tool_index[t.tool_id] = t
+
+            if td['parent_id'] == 0:
+                self.root_nodes.append(t)
+            else:
+                parent = tool_objs.get(td['parent_id'])
+                if parent is not None and isinstance(parent, HyLogicTool):
+                    parent.add_child(t)
+
+        # 앵커 복원
+        if anchor_id and anchor_id in tool_objs:
+            self.anchor = tool_objs[anchor_id]
+
+        self._dirty = False
+        return True
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def __repr__(self):
         return (f"<RecipeTree tools={len(self.tool_index)} "

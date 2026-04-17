@@ -93,6 +93,10 @@ class HyLink(QThread):
     # 명령 전송 (UI → HyLink → Device/VVM)
     # ─────────────────────────────────────────────────────────────────────────
 
+    def save_recipe(self, target_id: int = 0):
+        """P3-03: CMD_SAVE_RECIPE(0x18) — 장치 Flash에 레시피 영구 저장 요청."""
+        self.send_command(HyProtocol.CMD_SAVE_RECIPE, target_id=target_id)
+
     def send_command(self, cmd_id: int, target_id: int = 0,
                      target_type: int = 0, params=(0, 0, 0, 0),
                      fparam: float = 0.0, payload: bytes = b''):
