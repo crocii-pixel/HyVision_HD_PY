@@ -910,6 +910,12 @@ class InspectorApp(QMainWindow):
                 btn_logic_add.mapToGlobal(QPoint(0, btn_logic_add.height()))))
         tree_header.addWidget(btn_logic_add)
 
+        # P4-32: 템플릿 라이브러리 버튼
+        btn_tmpl_lib = _icon_btn("📂 라이브러리", "저장된 템플릿 열기")
+        btn_tmpl_lib.setFixedWidth(96)
+        btn_tmpl_lib.clicked.connect(self._show_template_library)
+        tree_header.addWidget(btn_tmpl_lib)
+
         center_vb.addLayout(tree_header)
         self._logic_tree = LogicTreeWidget(self.recipe)
         self._logic_tree.itemClicked.connect(self._on_tree_item_clicked)
@@ -939,6 +945,8 @@ class InspectorApp(QMainWindow):
         self._canvas_run.show_spec_box     = True
         self._canvas_run.show_roi_boxes    = True
         self._canvas_run.show_result_cross = True
+        # P4-18: OSD 더블클릭 → 설정 패널
+        self._canvas_run.sig_osd_settings_requested.connect(self._show_osd_settings)
         vb.addWidget(self._canvas_run)
         return w
 
@@ -1433,6 +1441,147 @@ class InspectorApp(QMainWindow):
             self._sb_wb_b.setValue(    s.get('wb_b',     128))
         self._send_camera_settings(s)
         self.log("카메라 설정 롤백 완료")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # P4-18: OSD 설정 패널 (더블클릭 팝업)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _show_osd_settings(self, box_type: str):
+        """OSD 박스 더블클릭 시 설정 다이얼로그 표시."""
+        canvas = self._canvas_run
+        dlg = QDialog(self)
+        dlg.setWindowTitle("OSD 설정")
+        dlg.setFixedWidth(300)
+        dlg.setStyleSheet(
+            "QDialog{background:#0f172a;color:#e2e8f0;}"
+            "QLabel{color:#94a3b8;font-size:11px;}"
+            "QCheckBox{color:#e2e8f0;font-size:11px;}"
+            "QPushButton{background:#1e293b;border:1px solid #475569;"
+            "border-radius:4px;padding:5px 10px;color:#e2e8f0;}"
+            "QPushButton:hover{background:#334155;}")
+        vb = QVBoxLayout(dlg)
+        vb.setSpacing(10)
+
+        title = QLabel(f"OSD 설정 — {'Status Box' if box_type == 'status' else 'Spec Box'}")
+        title.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        title.setStyleSheet("color:#e2e8f0;font-size:12px;")
+        vb.addWidget(title)
+
+        # 가시성 토글
+        from PyQt5.QtWidgets import QCheckBox as _QCB
+        chk_status = _QCB("Status Box 표시")
+        chk_status.setChecked(canvas.show_status_box)
+        chk_status.toggled.connect(lambda v: setattr(canvas, 'show_status_box', v))
+        vb.addWidget(chk_status)
+
+        chk_spec = _QCB("Spec Box 표시")
+        chk_spec.setChecked(canvas.show_spec_box)
+        chk_spec.toggled.connect(lambda v: setattr(canvas, 'show_spec_box', v))
+        vb.addWidget(chk_spec)
+
+        chk_cross = _QCB("결과 십자선 표시")
+        chk_cross.setChecked(canvas.show_result_cross)
+        chk_cross.toggled.connect(lambda v: setattr(canvas, 'show_result_cross', v))
+        vb.addWidget(chk_cross)
+
+        chk_roi = _QCB("ROI 박스 표시")
+        chk_roi.setChecked(canvas.show_roi_boxes)
+        chk_roi.toggled.connect(lambda v: setattr(canvas, 'show_roi_boxes', v))
+        vb.addWidget(chk_roi)
+
+        # 위치 초기화
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("QFrame{color:#1e293b;}")
+        vb.addWidget(sep)
+
+        btn_reset_status = QPushButton("Status Box 위치 초기화")
+        btn_reset_status.clicked.connect(
+            lambda: (setattr(canvas, '_osd_status_pos', None), canvas.update()))
+        vb.addWidget(btn_reset_status)
+
+        btn_reset_spec = QPushButton("Spec Box 위치 초기화")
+        btn_reset_spec.clicked.connect(
+            lambda: (setattr(canvas, '_osd_spec_pos', None), canvas.update()))
+        vb.addWidget(btn_reset_spec)
+
+        # 닫기
+        btn_close = QPushButton("✕ 닫기")
+        btn_close.clicked.connect(dlg.accept)
+        btn_close.setStyleSheet(
+            "QPushButton{background:#0ea5e9;border:none;border-radius:4px;color:white;padding:6px;}")
+        vb.addWidget(btn_close)
+
+        dlg.exec_()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # P4-32: 템플릿 라이브러리 패널
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _show_template_library(self):
+        """📂 라이브러리 버튼 → 저장된 템플릿 목록 다이얼로그. 더블클릭 삽입."""
+        templates = LogicTreeWidget._load_templates()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("📂 템플릿 라이브러리")
+        dlg.setMinimumSize(320, 380)
+        dlg.setStyleSheet(
+            "QDialog{background:#0f172a;color:#e2e8f0;}"
+            "QListWidget{background:#0b1120;border:1px solid #1e293b;"
+            "color:#e2e8f0;font-size:11px;}"
+            "QListWidget::item:selected{background:#1e293b;}"
+            "QPushButton{background:#1e293b;border:1px solid #475569;"
+            "border-radius:4px;padding:5px 10px;color:#e2e8f0;}"
+            "QPushButton:hover{background:#334155;}"
+            "QLabel{color:#94a3b8;font-size:10px;}")
+        vb = QVBoxLayout(dlg)
+
+        lbl = QLabel("저장된 로직 템플릿 — 더블클릭으로 루트에 삽입합니다.")
+        lbl.setWordWrap(True)
+        vb.addWidget(lbl)
+
+        lst = QListWidget()
+        for t in templates:
+            lst.addItem(t['name'])
+        vb.addWidget(lst, 1)
+
+        def _insert():
+            row = lst.currentRow()
+            if 0 <= row < len(templates):
+                self._logic_tree._paste_subtree(templates[row]['tree'], parent_id=0)
+                self._logic_tree.rebuild()
+                self.log(f"템플릿 삽입: {templates[row]['name']}", "success")
+            dlg.accept()
+
+        lst.itemDoubleClicked.connect(lambda _: _insert())
+
+        btn_row = QHBoxLayout()
+        btn_ins = QPushButton("⬇ 삽입")
+        btn_ins.setStyleSheet(
+            "QPushButton{background:#0ea5e9;border:none;border-radius:4px;color:white;padding:6px;}")
+        btn_ins.clicked.connect(_insert)
+
+        btn_del = QPushButton("🗑 삭제")
+        def _del_tmpl():
+            row = lst.currentRow()
+            if 0 <= row < len(templates):
+                name = templates[row]['name']
+                updated = [t for t in templates if t['name'] != name]
+                os.makedirs(_TEMPLATE_DIR, exist_ok=True)
+                with open(_TEMPLATE_FILE, 'w', encoding='utf-8') as f:
+                    json.dump({'templates': updated}, f, ensure_ascii=False, indent=2)
+                templates.clear()
+                templates.extend(updated)
+                lst.takeItem(row)
+        btn_del.clicked.connect(_del_tmpl)
+
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_ins)
+        btn_row.addWidget(btn_del)
+        btn_row.addWidget(btn_close)
+        vb.addLayout(btn_row)
+
+        dlg.exec_()
 
     # ─────────────────────────────────────────────────────────────────────────
     # TEST 모드

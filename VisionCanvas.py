@@ -48,6 +48,8 @@ class VisionCanvas(QWidget):
     sig_roi_changed = pyqtSignal(int, float, float, float, float)   # tool_id, x,y,w,h
     # 툴 클릭됐을 때
     sig_tool_selected = pyqtSignal(int)   # tool_id  (-1 = 선택 해제)
+    # P4-18: OSD 박스 더블클릭 → OSD 설정 패널 요청
+    sig_osd_settings_requested = pyqtSignal(str)   # "status" | "spec"
 
     def __init__(self, recipe_tree=None, parent=None):
         super().__init__(parent)
@@ -144,6 +146,17 @@ class VisionCanvas(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
+            # P4-18: RUN 모드에서 OSD 박스 더블클릭 → 설정 패널 요청
+            if self._mode == self.MODE_RUN:
+                pos = QPointF(event.pos())
+                sr   = self._osd_status_rect()
+                specr = self._osd_spec_rect()
+                if sr is not None and sr.contains(pos):
+                    self.sig_osd_settings_requested.emit("status")
+                    return
+                if specr is not None and specr.contains(pos):
+                    self.sig_osd_settings_requested.emit("spec")
+                    return
             self.fit_to_screen()
 
     def wheelEvent(self, event):
